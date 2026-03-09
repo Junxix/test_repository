@@ -7,8 +7,7 @@ logs
 logs/
 vis_track_embedding/
 vis_target_time_matrix*/
-vis*/
-attn*.png
+eval*/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

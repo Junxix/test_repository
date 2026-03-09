@@ -514,6 +514,7 @@ class RealWorldDataset(Dataset):
             # Load semantics
             human_semantic_path = os.path.join(human_semantic_dir, f"target_{target_idx}.npy")
             if not os.path.exists(human_semantic_path):
+                print(human_semantic_path)
                 raise FileNotFoundError(f"Human semantic file not found")
             human_semantic = np.load(human_semantic_path)
             
@@ -864,11 +865,8 @@ class RealWorldDataset(Dataset):
         human_tracks_rel_tensor = torch.from_numpy(full_human_tracks_rel).float()
         robot_tracks_abs_tensor = torch.from_numpy(full_robot_tracks_abs).float()
         robot_tracks_rel_tensor = torch.from_numpy(full_robot_tracks_rel).float()
-        # print(human_semantics.shape)
-        # print(robot_semantics.shape)
-        human_semantics_tensor = torch.from_numpy(human_semantics[0,:,:]).float()
-        # robot_semantics_tensor = torch.from_numpy(robot_semantics[:, end_idx-1, :]).float()
-        robot_semantics_tensor = torch.from_numpy(robot_semantics[:, 0, :]).float()
+        human_semantics_tensor = torch.from_numpy(human_semantics).float()
+        robot_semantics_tensor = torch.from_numpy(robot_semantics[:, end_idx-1, :]).float()
 
         
         ret_dict = {
