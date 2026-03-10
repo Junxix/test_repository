@@ -25,11 +25,10 @@ def create_pointcloud_from_rgbd_data(rgb_img, depth_img, intrinsics_matrix, extr
     valid_mask = (depth > 0) & (~np.isinf(depth)) & (scaled_depth >= min_depth) & (scaled_depth <= max_depth)
     
     intrinsics_matrix = np.array([
-        [914.81945801,   0.        , 630.63891602],
-       [  0.        , 913.88464355, 352.51571655],
+        [922.37457275,   0.        , 637.55419922],
+        [  0.        , 922.46069336, 368.37557983],
         [  0.        ,   0.        ,   1.        ]
     ])
-
     fx, fy = intrinsics_matrix[0, 0], intrinsics_matrix[1, 1]
     cx, cy = intrinsics_matrix[0, 2], intrinsics_matrix[1, 2]
     
@@ -136,6 +135,7 @@ def visualize_trajectory_pointcloud_open3d(npz_path: str, max_points: int = 5000
     first_frame_depth = depths[0]  # (H, W)
     first_frame_intrinsics = intrinsics[0]  # (3, 3)
     first_frame_extrinsics = extrinsics[0]  # (4, 4)
+    print(first_frame_extrinsics)
 
     logger.info("Generating background point cloud from first frame...")
     

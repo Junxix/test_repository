@@ -1,11 +1,11 @@
 #!/bin/bash
 
 
-BASE_PATH="/data/jingjing/data/context/realdata_sampled_20260109"
+BASE_PATH="/data/jingjing/data/context/realdata_sampled_20251030"
 
-for i in {1..4}; do
+for i in {1..50}; do
     SCENE=$(printf "scene_%04d" $i)
-    SCENE_PATH="task_0105_user_0999_${SCENE}_cfg_0001"
+    SCENE_PATH="task_0102_user_0555_${SCENE}_cfg_0001"
     
     COLOR_DIR="${BASE_PATH}/train/${SCENE_PATH}/cam_104122063550/color"
     DEPTH_DIR="${BASE_PATH}/train/${SCENE_PATH}/cam_104122063550/depth"

@@ -16,6 +16,10 @@ TO_TENSOR_KEYS = [
     'robot_semantics'
 ]
 
+REL_TRANS_MAX = 0.1  
+REL_GRIPPER_MAX = 0.05  
+
+# camera intrinsics
 INTRINSICS = {
     "043322070878": np.array([[909.72656250, 0, 645.75042725, 0],
                               [0, 909.66497803, 349.66162109, 0],

@@ -1,6 +1,7 @@
+
 """
-批量处理脚本 - 分开追踪human和robot阶段
-human使用mask_target_before_x.png，robot使用mask_target_after_x.png
+批量处理脚本 - 支持 PNG 到 JPG 转换和 SAM2 追踪
+处理 scene_0051 到 scene_0099
 """
 import torch
 import torch.nn.functional as F
@@ -16,9 +17,9 @@ import shutil
 import cv2
 
 # ==================== 配置 ====================
-BASE_DIR = "/data/jingjing/data/context/realdata_sampled_20260109/train"
-START_SCENE = 4
-END_SCENE = 6
+BASE_DIR = "/data/jingjing/data/context/realdata_sampled_20251110/train"
+START_SCENE = 22
+END_SCENE = 23
 PATCH_SIZE = 14
 IMAGE_SIZE = 896
 GRID_SIZE = IMAGE_SIZE // PATCH_SIZE
@@ -141,6 +142,41 @@ def compute_target_features(mask, patch_tokens):
         return reference_feature, selected_positions, mask_binary
     return None, [], mask_binary
 
+def visualize_all_targets(processed_image, targets_data, scene_name, image_name, output_path):
+    fig, axes = plt.subplots(4, 2, figsize=(16, 28))
+    
+    for target_id in range(1, 5):
+        row_idx = target_id - 1
+        data = targets_data[target_id]
+        
+        if data['feature'] is not None:
+            axes[row_idx, 0].imshow(processed_image)
+            axes[row_idx, 0].imshow(data['mask_binary'], alpha=0.5, cmap='Reds')
+            for r, c in data['positions']:
+                rect = plt.Rectangle((c * PATCH_SIZE, r * PATCH_SIZE), PATCH_SIZE, PATCH_SIZE, 
+                                    fill=False, edgecolor='yellow', linewidth=1)
+                axes[row_idx, 0].add_patch(rect)
+            axes[row_idx, 0].set_title(f'Target {target_id} ({len(data["positions"])} patches) - {image_name}', fontsize=10)
+            axes[row_idx, 0].axis('off')
+            
+            im = axes[row_idx, 1].imshow(data['similarity_map'], cmap='jet', vmin=0, vmax=1)
+            axes[row_idx, 1].set_title(f'Target {target_id} Similarity Map', fontsize=10)
+            axes[row_idx, 1].axis('off')
+            plt.colorbar(im, ax=axes[row_idx, 1], fraction=0.046, pad=0.04)
+        else:
+            axes[row_idx, 0].imshow(processed_image)
+            axes[row_idx, 0].set_title(f'Target {target_id} - No Detection', fontsize=10)
+            axes[row_idx, 0].axis('off')
+            axes[row_idx, 1].text(0.5, 0.5, 'No Target', ha='center', va='center', fontsize=12)
+            axes[row_idx, 1].set_xlim(0, 1)
+            axes[row_idx, 1].set_ylim(0, 1)
+            axes[row_idx, 1].axis('off')
+    
+    plt.suptitle(f'{scene_name} - {image_name}', fontsize=14, y=0.995)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
 def track_with_sam2(jpg_dir, initial_masks):
     """使用 SAM2 追踪"""
     if not USE_SAM2:
@@ -171,15 +207,19 @@ def track_with_sam2(jpg_dir, initial_masks):
         print(f"  ✗ SAM2 追踪失败: {e}")
         return None
 
-def process_frames(image_list, video_segments, initial_masks, feature_dict, scene_name):
+def process_frames(image_list, video_segments, initial_masks, feature_dict, sim_dir, scene_name, start_idx=0):
     """处理一组帧"""
     for img_idx, image_path in enumerate(tqdm(image_list, desc="Processing", leave=False)):
+        image_name = os.path.basename(image_path)
+        frame_idx = start_idx + img_idx
+        
         patch_tokens, processed_image = extract_siglip_features(image_path)
         
+        targets_data = {}
         for target_id in range(1, 5):
             # 获取 mask
-            if video_segments and img_idx in video_segments and target_id in video_segments[img_idx]:
-                mask = video_segments[img_idx][target_id]
+            if video_segments and frame_idx in video_segments and target_id in video_segments[frame_idx]:
+                mask = video_segments[frame_idx][target_id]
             else:
                 mask = initial_masks.get(target_id)
             
@@ -187,20 +227,46 @@ def process_frames(image_list, video_segments, initial_masks, feature_dict, scen
                 feature, positions, mask_binary = compute_target_features(mask, patch_tokens)
                 
                 if feature is not None:
+                    feature_normalized = F.normalize(feature, p=2, dim=1)
+                    patch_tokens_normalized = F.normalize(patch_tokens, p=2, dim=1)
+                    cosine_sim = torch.mm(feature_normalized, patch_tokens_normalized.T)
+                    similarity_map = cosine_sim.squeeze(0).cpu().numpy().reshape(GRID_SIZE, GRID_SIZE)
+                    
+                    targets_data[target_id] = {
+                        'feature': feature,
+                        'positions': positions,
+                        'mask_binary': mask_binary,
+                        'similarity_map': similarity_map
+                    }
                     feature_dict[target_id].append(feature.cpu().numpy())
+                else:
+                    targets_data[target_id] = {
+                        'feature': None,
+                        'positions': [],
+                        'mask_binary': mask_binary,
+                        'similarity_map': None
+                    }
+            else:
+                targets_data[target_id] = {
+                    'feature': None,
+                    'positions': [],
+                    'mask_binary': np.zeros((IMAGE_SIZE, IMAGE_SIZE)),
+                    'similarity_map': None
+                }
+        
+        output_path = os.path.join(sim_dir, f"{image_name.replace('.png', '_similarity.png')}")
+        # visualize_all_targets(processed_image, targets_data, scene_name, image_name, output_path)
 
 def process_scene(scene_id):
-    num_targets = 2
     """处理单个场景"""
     scene_name = f"scene_{scene_id:04d}"
-    scene_base = os.path.join(BASE_DIR, f"task_0105_user_0999_{scene_name}_cfg_0001")
+    scene_base = os.path.join(BASE_DIR, f"task_0103_user_0555_{scene_name}_cfg_0001")
     scene_path = os.path.join(scene_base, "cam_104122063550")
     
     color_dir = os.path.join(scene_path, "color")
     mask_dir = os.path.join(scene_path, "sam2_tapip3d_results_offline")
     json_path = os.path.join(scene_base, "human.json")
-    tmp_human_jpg_dir = os.path.join(scene_path, "tmp_human_jpg_for_sam2")
-    tmp_robot_jpg_dir = os.path.join(scene_path, "tmp_robot_jpg_for_sam2")
+    tmp_jpg_dir = os.path.join(scene_path, "tmp_jpg_for_sam2")
     
     # 检查必要文件
     for path in [color_dir, mask_dir, json_path]:
@@ -208,9 +274,12 @@ def process_scene(scene_id):
             return False, f"{os.path.basename(path)} 不存在"
     
     # 创建输出目录
+    human_sim_dir = os.path.join(scene_path, "human_siglip_similarity")
+    robot_sim_dir = os.path.join(scene_path, "robot_siglip_similarity")
     human_feat_dir = os.path.join(scene_path, "human_siglip")
     robot_feat_dir = os.path.join(scene_path, "robot_siglip")
     
+    # for dir_path in [human_sim_dir, robot_sim_dir, human_feat_dir, robot_feat_dir]:
     for dir_path in [human_feat_dir, robot_feat_dir]:
         if os.path.exists(dir_path):
             shutil.rmtree(dir_path)
@@ -224,61 +293,38 @@ def process_scene(scene_id):
     
     human_images, robot_images = classify_images(png_files, timestamps['robot_start_time'])
     
-    # 加载 human 和 robot 的初始 masks
-    human_initial_masks = {}
-    robot_initial_masks = {}
-    for target_id in range(1, num_targets+1):
-        human_mask_path = os.path.join(mask_dir, f"mask_target_before_{target_id}.png")
-        robot_mask_path = os.path.join(mask_dir, f"mask_target_after_{target_id}.png")
-        
-        if os.path.exists(human_mask_path):
-            human_initial_masks[target_id] = Image.open(human_mask_path).convert('L')
+    # 加载初始 masks
+    initial_masks = {}
+    for target_id in range(1, 5):
+        mask_path = os.path.join(mask_dir, f"mask_target_{target_id}.png")
+        if os.path.exists(mask_path):
+            initial_masks[target_id] = Image.open(mask_path).convert('L')
         else:
-            human_initial_masks[target_id] = None
-            
-        if os.path.exists(robot_mask_path):
-            robot_initial_masks[target_id] = Image.open(robot_mask_path).convert('L')
-        else:
-            robot_initial_masks[target_id] = None
+            initial_masks[target_id] = None
     
     human_features = {i: [] for i in range(1, 5)}
     robot_features = {i: [] for i in range(1, 5)}
     
     try:
-        # ========== 处理 Human 阶段 ==========
+        # 转换 PNG 到 JPG
+        print(f"  转换 PNG 到 JPG...")
+        convert_png_to_jpg(png_files, tmp_jpg_dir)
+        
+        # SAM2 追踪
+        video_segments = None
+        if USE_SAM2:
+            print(f"  SAM2 追踪...")
+            video_segments = track_with_sam2(tmp_jpg_dir, initial_masks)
+        
+        # 处理 human 和 robot 阶段
         print(f"  处理 Human: {len(human_images)} 帧")
+        process_frames(human_images, video_segments, initial_masks, human_features, human_sim_dir, scene_name, 0)
         
-        # 转换 PNG 到 JPG
-        convert_png_to_jpg(human_images, tmp_human_jpg_dir)
-        
-        # SAM2 追踪 human
-        human_video_segments = None
-        if USE_SAM2:
-            print(f"    SAM2 追踪 human...")
-            human_video_segments = track_with_sam2(tmp_human_jpg_dir, human_initial_masks)
-        
-        # 处理 human 帧
-        process_frames(human_images, human_video_segments, human_initial_masks, 
-                      human_features, scene_name)
-        
-        # ========== 处理 Robot 阶段 ==========
         print(f"  处理 Robot: {len(robot_images)} 帧")
-        
-        # 转换 PNG 到 JPG
-        convert_png_to_jpg(robot_images, tmp_robot_jpg_dir)
-        
-        # SAM2 追踪 robot
-        robot_video_segments = None
-        if USE_SAM2:
-            print(f"    SAM2 追踪 robot...")
-            robot_video_segments = track_with_sam2(tmp_robot_jpg_dir, robot_initial_masks)
-        
-        # 处理 robot 帧
-        process_frames(robot_images, robot_video_segments, robot_initial_masks, 
-                      robot_features, scene_name)
+        process_frames(robot_images, video_segments, initial_masks, robot_features, robot_sim_dir, scene_name, len(human_images))
         
         # 保存特征
-        for target_id in range(1, num_targets+1):
+        for target_id in range(1, 5):
             if len(human_features[target_id]) > 0:
                 np.save(os.path.join(human_feat_dir, f"target_{target_id}.npy"),
                        np.concatenate(human_features[target_id], axis=0))
@@ -289,10 +335,8 @@ def process_scene(scene_id):
         return True, f"Human={len(human_images)}, Robot={len(robot_images)}"
     
     finally:
-        # 清理临时文件
-        for tmp_dir in [tmp_human_jpg_dir, tmp_robot_jpg_dir]:
-            if os.path.exists(tmp_dir):
-                shutil.rmtree(tmp_dir)
+        if os.path.exists(tmp_jpg_dir):
+            shutil.rmtree(tmp_jpg_dir)
 
 # ==================== 主程序 ====================
 if __name__ == "__main__":

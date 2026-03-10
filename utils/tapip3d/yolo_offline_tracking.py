@@ -1,4 +1,3 @@
-
 import os
 import sys
 import torch
@@ -17,6 +16,9 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 import torch.nn.functional as F
 
+# YOLO相关导入
+from ultralytics import YOLO
+
 sys.path.append('/home/jingjing/workspace/su1/TAPIP3D/')
 from utils.inference_utils import load_model, inference_with_mask, get_grid_queries, inference
 from utils.common_utils import batch_unproject, batch_project, setup_logger
@@ -31,7 +33,7 @@ DEFAULT_DEVICE = (
 
 class ImprovedSAM2TAPIP3DIntegration:
     def __init__(self, sam2_checkpoint: str, sam2_config: str, tapip3d_checkpoint: str, 
-                 device: str = "auto"):
+                 yolo_model: str = "yolov8n.pt", device: str = "auto"):
         self.device = self._setup_device(device)
         self.sam2_checkpoint = sam2_checkpoint
         self.sam2_config = sam2_config
@@ -39,11 +41,8 @@ class ImprovedSAM2TAPIP3DIntegration:
         
         self._init_sam2()
         self._init_tapip3d()
+        self._init_yolo(yolo_model)
         
-        self.points = []
-        self.labels = []
-        self.is_accepting_clicks = True
-        self.mask = None
         self.inference_state = None
         self.video_dir = None  
         
@@ -74,7 +73,7 @@ class ImprovedSAM2TAPIP3DIntegration:
             self.sam2_checkpoint, 
             device=self.device
         )
-        print(f"SAM2 model loaded on {self.device}")
+        print(f"SAM2模型已加载到 {self.device}")
     
     def _init_tapip3d(self):
         self.tapip3d_model = load_model(self.tapip3d_checkpoint)
@@ -84,17 +83,22 @@ class ImprovedSAM2TAPIP3DIntegration:
         if hasattr(self.tapip3d_model, "set_eval_mode"):
             self.tapip3d_model.set_eval_mode("raw")
         
-        print(f"TAPIP3D model loaded on {self.device}")
+        print(f"TAPIP3D模型已加载到 {self.device}")
+    
+    def _init_yolo(self, yolo_model: str):
+        """初始化YOLO模型"""
+        self.yolo_model = YOLO(yolo_model)
+        print(f"YOLO模型已加载: {yolo_model}")
     
     def load_data(self, input_path: str, target_resolution: Optional[Tuple[int, int]] = None):
-        print(f"loading data from {input_path} ...")
+        print(f"从 {input_path} 加载数据...")
         
         if input_path.endswith(('.mp4', '.avi', '.mov', '.webm')):
             self._load_video_data(input_path, target_resolution)
         elif input_path.endswith('.npz'):
             self._load_npz_data(input_path, target_resolution)
         else:
-            raise ValueError(f"not supported input file: {input_path}")
+            raise ValueError(f"不支持的输入文件格式: {input_path}")
     
     def _load_video_data(self, video_path: str, target_resolution: Optional[Tuple[int, int]]):
         video = self._read_video(video_path)
@@ -111,23 +115,19 @@ class ImprovedSAM2TAPIP3DIntegration:
         data = np.load(npz_path)
         
         if 'video' not in data:
-            raise ValueError("NPZ file must contain 'video' key.")
+            raise ValueError("NPZ文件必须包含'video'键")
         
         video = data['video']
         if video.ndim == 4 and video.shape[-1] == 3:
-            # (T, H, W, 3) -> (T, 3, H, W)
             self.video_data = torch.from_numpy(video).permute(0, 3, 1, 2).float() / 255.0
         else:
-            raise ValueError(f"video shape {video.shape} not supported.")
+            raise ValueError(f"视频形状 {video.shape} 不支持")
         
         if 'depths' in data:
             self.depth_data = torch.from_numpy(data['depths']).float()
         
         self.intrinsics = torch.from_numpy(data.get('intrinsics', self._create_default_intrinsics())).float()
         
-        # if 'extrinsics' in data and data['extrinsics'] is not None:
-        #     self.extrinsics = torch.from_numpy(data['extrinsics']).float()
-        # else:
         T = self.video_data.shape[0]
         self.extrinsics = torch.eye(4).unsqueeze(0).repeat(T, 1, 1).float()
     
@@ -160,10 +160,10 @@ class ImprovedSAM2TAPIP3DIntegration:
         T, _, H, W = self.video_data.shape
         f = min(H, W) / (2 * np.tan(np.pi / 6))
         intrinsics = np.eye(3)
-        intrinsics[0, 0] = f  # fx
-        intrinsics[1, 1] = f  # fy
-        intrinsics[0, 2] = W / 2  # cx
-        intrinsics[1, 2] = H / 2  # cy
+        intrinsics[0, 0] = f
+        intrinsics[1, 1] = f
+        intrinsics[0, 2] = W / 2
+        intrinsics[1, 2] = H / 2
         return np.tile(intrinsics[None], (T, 1, 1))
     
     def _resize_data(self, target_resolution: Tuple[int, int]):
@@ -208,139 +208,154 @@ class ImprovedSAM2TAPIP3DIntegration:
         return str(video_dir)
     
     def _reset_sam2_state_for_new_target(self):
-        print("set sam2 state for new target")
+        print("重置SAM2状态以处理新目标")
         
         if self.video_dir is not None:
             self.inference_state = self.sam2_predictor.init_state(video_path=self.video_dir)
-            print("sam2 state initialized")
+            print("SAM2状态已初始化")
         else:
-            raise ValueError("video_dir is None, please run prepare_sam2_video() first.")
+            raise ValueError("video_dir为None，请先运行prepare_sam2_video()")
     
-    def interactive_segment(self, frame_idx: int = 0, target_id: int = 1) -> Optional[torch.Tensor]:
-        self._reset_sam2_state_for_new_target()
+    def detect_objects_yolo(self, frame_idx: int = 0, conf_threshold: float = 0.25, 
+                           class_filter: Optional[List[int]] = None) -> List[Dict]:
+        """
+        使用YOLO检测第一帧中的对象
         
-        self.points = []
-        self.labels = []
-        self.is_accepting_clicks = True
-        self.mask = None
+        Args:
+            frame_idx: 帧索引
+            conf_threshold: 置信度阈值
+            class_filter: 要检测的类别ID列表，None表示检测所有类别
         
+        Returns:
+            检测结果列表，每个元素包含bbox、confidence、class_id、class_name
+        """
+        frame = self.video_data[frame_idx].permute(1, 2, 0).cpu().numpy()
+        frame = (frame * 255).astype(np.uint8)
+        
+        # YOLO推理
+        results = self.yolo_model(frame, conf=conf_threshold, verbose=False)
+        
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            for i, box in enumerate(boxes):
+                class_id = int(box.cls[0])
+                
+                # 类别过滤
+                if class_filter is not None and class_id not in class_filter:
+                    continue
+                
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                confidence = float(box.conf[0])
+                class_name = result.names[class_id]
+                
+                detections.append({
+                    'bbox': [x1, y1, x2, y2],
+                    'confidence': confidence,
+                    'class_id': class_id,
+                    'class_name': class_name
+                })
+        
+        print(f"在第{frame_idx}帧检测到 {len(detections)} 个对象")
+        return detections
+    
+    def visualize_detections(self, frame_idx: int, detections: List[Dict], 
+                            save_path: Optional[str] = None):
+        """可视化YOLO检测结果"""
         frame = self.video_data[frame_idx].permute(1, 2, 0).cpu().numpy()
         frame = (frame * 255).astype(np.uint8)
         
         plt.figure(figsize=(12, 8))
-        plt.title(f"target {target_id} - frame {frame_idx} ")
         plt.imshow(frame)
+        ax = plt.gca()
         
-        onclick_callback = functools.partial(
-            self._on_click, 
-            frame_idx=frame_idx, 
-            target_id=target_id
-        )
-        onkey_callback = functools.partial(
-            self._on_key, 
-            frame_idx=frame_idx, 
-            target_id=target_id
-        )
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2 = det['bbox']
+            confidence = det['confidence']
+            class_name = det['class_name']
+            
+            # 绘制边界框
+            rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                fill=False, edgecolor='red', linewidth=2)
+            ax.add_patch(rect)
+            
+            # 添加标签
+            label = f"[{i}] {class_name}: {confidence:.2f}"
+            ax.text(x1, y1-5, label, color='red', fontsize=10,
+                   bbox=dict(facecolor='white', alpha=0.7))
         
-        canvas = plt.gcf().canvas
-        canvas.mpl_connect('button_press_event', onclick_callback)
-        canvas.mpl_connect('key_press_event', onkey_callback)
+        plt.title(f"YOLO检测结果 - 第{frame_idx}帧 (共{len(detections)}个对象)")
+        plt.axis('off')
         
-        plt.show()
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+            print(f"检测结果已保存到: {save_path}")
         
-        if self.mask is not None:
-            print(f"target {target_id} annotation completed with {len(self.points)} points.")
-            return torch.from_numpy(self.mask.astype(bool))
-        else:
-            print(f"target {target_id} annotation skipped.")
-            return None
+        # plt.show()
     
-    def _on_click(self, event, frame_idx: int, target_id: int):
-        if not self.is_accepting_clicks or event.xdata is None or event.ydata is None:
-            return
-            
-        x, y = int(event.xdata), int(event.ydata)
-        self.is_accepting_clicks = False
+    def auto_segment_with_bbox(self, frame_idx: int, bbox: List[float], 
+                               target_id: int = 1) -> Optional[torch.Tensor]:
+        """
+        使用bounding box自动生成mask
         
-        if event.button in [1, 3]: 
-            label = 1 if event.button == 1 else 0
-            self.points.append([x, y])
-            self.labels.append(label)
-            print(f" add point: {[x, y]} with label {label}")
-            
-            self._update_sam2_prediction(frame_idx, target_id)
-            
-        self.is_accepting_clicks = True
-    
-    def _on_key(self, event, frame_idx: int, target_id: int):
-        if event.key == 'z' and len(self.points) > 0:
-            removed_point = self.points.pop()
-            removed_label = self.labels.pop()
-            print(f"delete point: {removed_point} with label {removed_label}")
-            
-            if len(self.points) > 0:
-                self._update_sam2_prediction(frame_idx, target_id)
-            else:
-                self._clear_display()
-    
-    def _update_sam2_prediction(self, frame_idx: int, target_id: int):
-        if len(self.points) == 0:
-            return
-            
+        Args:
+            frame_idx: 帧索引
+            bbox: [x1, y1, x2, y2] 格式的边界框
+            target_id: 目标ID
+        
+        Returns:
+            生成的mask (torch.Tensor)
+        """
+        self._reset_sam2_state_for_new_target()
+        
+        # 将bbox传递给SAM2
         _, out_obj_ids, out_mask_logits = self.sam2_predictor.add_new_points_or_box(
             inference_state=self.inference_state,
             frame_idx=frame_idx,
-            obj_id=1,
-            points=np.array(self.points),
-            labels=np.array(self.labels)
+            obj_id=target_id,
+            box=np.array(bbox)
         )
         
-        self._clear_display()
+        # 提取mask
+        mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+        if len(mask.shape) == 3:
+            mask = mask[0]
         
-        for i, out_obj_id in enumerate(out_obj_ids):
-            mask = (out_mask_logits[i] > 0.0).cpu().numpy()
-            if len(mask.shape) == 3:
-                mask = mask[0]
-            self.mask = mask
-            self._show_points(np.array(self.points), np.array(self.labels))
-            self._show_mask(mask, obj_id=target_id)
+        print(f"目标 {target_id} 的mask已生成，bbox: {bbox}")
+        return torch.from_numpy(mask.astype(bool))
     
-    def _clear_display(self):
-        ax = plt.gca()
-        images = ax.images
-        if len(images) > 1:
-            for img in images[1:]:
-                img.remove()
-        for collection in ax.collections:
-            collection.remove()
-        plt.draw()
-    
-    def _show_points(self, coords, labels, marker_size=200):
-        ax = plt.gca()
-        pos_points = coords[labels == 1]
-        neg_points = coords[labels == 0]
+    def visualize_mask(self, frame_idx: int, mask: torch.Tensor, bbox: Optional[List[float]] = None,
+                      title: str = "Mask可视化", save_path: Optional[str] = None):
+        """可视化mask"""
+        frame = self.video_data[frame_idx].permute(1, 2, 0).cpu().numpy()
+        frame = (frame * 255).astype(np.uint8)
         
-        if len(pos_points) > 0:
-            ax.scatter(pos_points[:, 0], pos_points[:, 1], 
-                      color='green', marker='*', s=marker_size, 
-                      edgecolor='white', linewidth=1.25)
-        if len(neg_points) > 0:
-            ax.scatter(neg_points[:, 0], neg_points[:, 1], 
-                      color='red', marker='*', s=marker_size, 
-                      edgecolor='white', linewidth=1.25)
-    
-    def _show_mask(self, mask, obj_id=None):
-        ax = plt.gca()
+        plt.figure(figsize=(12, 8))
+        plt.imshow(frame)
         
-        if obj_id is not None:
-            color = np.array([*plt.get_cmap("tab10")(obj_id)[:3], 0.6])
-        else:
-            color = np.array([1, 0, 0, 0.6])
-            
-        h, w = mask.shape[-2:]
-        mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-        ax.imshow(mask_image, alpha=0.6)
-        plt.draw()
+        # 显示mask
+        mask_np = mask.cpu().numpy() if torch.is_tensor(mask) else mask
+        h, w = mask_np.shape[-2:]
+        color = np.array([1, 0, 0, 0.6])
+        mask_image = mask_np.reshape(h, w, 1) * color.reshape(1, 1, -1)
+        plt.imshow(mask_image, alpha=0.6)
+        
+        # 如果有bbox，也显示出来
+        if bbox is not None:
+            ax = plt.gca()
+            x1, y1, x2, y2 = bbox
+            rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                fill=False, edgecolor='green', linewidth=2)
+            ax.add_patch(rect)
+        
+        plt.title(title)
+        plt.axis('off')
+        
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+            print(f"Mask可视化已保存到: {save_path}")
+        
+        # plt.show()
 
     def track_with_tapip3d(self, mask: torch.Tensor, grid_size: int = 0, 
                           num_iters: int = 6, vis_threshold: float = 0.9) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -379,14 +394,14 @@ class ImprovedSAM2TAPIP3DIntegration:
             coords = coords[:, :n_mask_points]
             visibs = visibs[:, :n_mask_points]
         
-        print(f"track_with_tapip3d done, got {coords.shape[1]} points")
+        print(f"TAPIP3D跟踪完成，获得 {coords.shape[1]} 个点")
         return coords, visibs
     
-    def _generate_query_points_from_mask(self, mask: torch.Tensor, num_points: int =150) -> torch.Tensor:
+    def _generate_query_points_from_mask(self, mask: torch.Tensor, num_points: int = 150) -> torch.Tensor:
         mask_indices = torch.nonzero(mask, as_tuple=False)
         
         if len(mask_indices) == 0:
-            raise ValueError("mask has no positive pixels.")
+            raise ValueError("mask中没有正像素")
         
         if len(mask_indices) > num_points:
             sampled_indices = torch.randperm(len(mask_indices))[:num_points]
@@ -413,14 +428,15 @@ class ImprovedSAM2TAPIP3DIntegration:
         world_coords = torch.einsum('ij,nj->ni', inv_extrinsic, camera_coords_homo)[:, :3]
         
         query_points = torch.cat([
-            torch.zeros(len(world_coords), 1, device=self.device),  # t=0
+            torch.zeros(len(world_coords), 1, device=self.device),
             world_coords
         ], dim=1).unsqueeze(0)
         
         return query_points
     
     def save_results(self, coords: torch.Tensor, visibs: torch.Tensor, 
-                    mask: torch.Tensor, target_id: int, output_dir: str = "./results"):
+                    mask: torch.Tensor, target_id: int, output_dir: str = "./results",
+                    detection_info: Optional[Dict] = None):
 
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         
@@ -438,22 +454,27 @@ class ImprovedSAM2TAPIP3DIntegration:
         mask_uint8 = (mask_np * 255).astype(np.uint8)
         Image.fromarray(mask_uint8).save(mask_path)
         
+        # 保存完整结果，包括检测信息
+        save_dict = {
+            'video': (self.video_data.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)[:1],
+            'depths': self.depth_data.cpu().numpy()[:1],
+            'intrinsics': self.intrinsics.cpu().numpy()[:1],
+            'extrinsics': self.extrinsics.cpu().numpy()[:1],
+            'coords': coords_np,
+            'visibs': visibs_np,
+            'mask': mask_np
+        }
+        
+        if detection_info:
+            save_dict['detection_info'] = detection_info
+        
         result_path = Path(output_dir) / f"complete_result_target_{target_id}.npz"
-        np.savez(
-            result_path,
-            video=(self.video_data.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)[:1],
-            depths=self.depth_data.cpu().numpy()[:1],
-            intrinsics=self.intrinsics.cpu().numpy()[:1],
-            extrinsics=self.extrinsics.cpu().numpy()[:1],
-            coords=coords_np,
-            visibs=visibs_np,
-            mask=mask_np
-        )
+        np.savez(result_path, **save_dict)
 
+        print(f"结果已保存到: {result_path}")
         return result_path
     
     def cleanup(self):
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
@@ -462,50 +483,112 @@ class ImprovedSAM2TAPIP3DIntegration:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="import and run SAM2 + TAPIP3D for 3D tracking")
-    parser.add_argument("--input", required=True, help="input video (.mp4) or npz file path")
-    parser.add_argument("--sam2_checkpoint", required=True, help="sam2 model checkpoint path")
-    parser.add_argument("--sam2_config", required=True, help="SAM2 config file path")
-    parser.add_argument("--tapip3d_checkpoint", required=True, help="TAPIP3D model checkpoint path")
-    parser.add_argument("--output_dir", default="./sam2_tapip3d_results", help="output directory")
-    parser.add_argument("--target_resolution", type=int, nargs=2, help="target resolution (H W) for input video or npz data")
-    parser.add_argument("--num_targets", type=int, default=5, help="number of targets to segment and track")
-    parser.add_argument("--grid_size", type=int, default=0, help="additional grid points for TAPIP3D tracking, 0 means no grid points")
-    parser.add_argument("--num_iters", type=int, default=6, help="iterations for TAPIP3D tracking")
-    parser.add_argument("--device", default="auto", help="device to use, e.g., 'cuda', 'cpu', or 'auto'")
+    parser = argparse.ArgumentParser(description="使用YOLO+SAM2+TAPIP3D进行自动3D跟踪")
+    parser.add_argument("--input", required=True, help="输入视频(.mp4)或npz文件路径")
+    parser.add_argument("--sam2_checkpoint", required=True, help="SAM2模型checkpoint路径")
+    parser.add_argument("--sam2_config", required=True, help="SAM2配置文件路径")
+    parser.add_argument("--tapip3d_checkpoint", required=True, help="TAPIP3D模型checkpoint路径")
+    parser.add_argument("--yolo_model", default="/data/jingjing/pretrained-models/yolo/yolov8n.pt", help="YOLO模型路径或名称")
+    parser.add_argument("--output_dir", default="./yolo_sam2_tapip3d_results", help="输出目录")
+    parser.add_argument("--target_resolution", type=int, nargs=2, help="目标分辨率 (H W)")
+    parser.add_argument("--num_targets", type=int, default=None, help="要跟踪的目标数量，None表示跟踪所有检测到的对象")
+    parser.add_argument("--grid_size", type=int, default=0, help="TAPIP3D额外的网格点数量")
+    parser.add_argument("--num_iters", type=int, default=6, help="TAPIP3D跟踪迭代次数")
+    parser.add_argument("--device", default="auto", help="设备: 'cuda', 'cpu', 或 'auto'")
+    parser.add_argument("--yolo_conf", type=float, default=0.25, help="YOLO置信度阈值")
+    parser.add_argument("--yolo_classes", type=int, nargs='+', help="要检测的YOLO类别ID，例如: 0 (person)")
+    parser.add_argument("--erode_mask", action='store_true', help="是否腐蚀mask以获得更精确的边界")
+    parser.add_argument("--visualize", action='store_true', help="是否可视化检测和分割结果")
     
     args = parser.parse_args()
     
     setup_logger()
 
+    # 初始化集成系统
     integrator = ImprovedSAM2TAPIP3DIntegration(
         sam2_checkpoint=args.sam2_checkpoint,
         sam2_config=args.sam2_config,
         tapip3d_checkpoint=args.tapip3d_checkpoint,
+        yolo_model=args.yolo_model,
         device=args.device
     )
     
+    # 加载数据
     target_resolution = tuple(args.target_resolution) if args.target_resolution else None
     integrator.load_data(args.input, target_resolution)
     
+    # 准备SAM2视频
     temp_dir = integrator.prepare_sam2_video()
     
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     
+    # 使用YOLO检测对象
+    print("\n" + "="*60)
+    print("使用YOLO检测对象...")
+    print("="*60)
+    detections = integrator.detect_objects_yolo(
+        frame_idx=0, 
+        conf_threshold=args.yolo_conf,
+        class_filter=args.yolo_classes
+    )
+    
+    if len(detections) == 0:
+        print("错误: 没有检测到任何对象！")
+        return 1
+    
+    # 可视化检测结果
+    if args.visualize:
+        integrator.visualize_detections(
+            frame_idx=0, 
+            detections=detections,
+            save_path=Path(args.output_dir) / "yolo_detections.png"
+        )
+    
+    # 确定要处理的目标数量
+    num_targets_to_process = args.num_targets if args.num_targets else len(detections)
+    num_targets_to_process = min(num_targets_to_process, len(detections))
+    
+    print(f"\n将处理 {num_targets_to_process}/{len(detections)} 个检测到的对象")
+    
+    # 对每个检测到的对象进行分割和跟踪
     results = []
-    for target_idx in range(args.num_targets):
+    for target_idx in range(num_targets_to_process):
+        detection = detections[target_idx]
         target_id = target_idx + 1
         
         print(f"\n{'='*60}")
-        print(f"target {target_id}/{args.num_targets}")
+        print(f"处理目标 {target_id}/{num_targets_to_process}")
+        print(f"类别: {detection['class_name']}, 置信度: {detection['confidence']:.2f}")
+        print(f"Bounding Box: {detection['bbox']}")
         print(f"{'='*60}")
         
-        mask = integrator.interactive_segment(frame_idx=0, target_id=target_id)
-        kernel_size = 5  
-        mask = mask.float().unsqueeze(0).unsqueeze(0)  # [1, 1, 720, 1280]
-        kernel = torch.ones(1, 1, kernel_size, kernel_size, device=mask.device)
-        mask = F.conv2d(F.pad(mask, (2, 2, 2, 2)), kernel)
-        mask = (mask == kernel_size * kernel_size).float().squeeze()  # [720, 1280]
+        # 使用bbox生成mask
+        mask = integrator.auto_segment_with_bbox(
+            frame_idx=0, 
+            bbox=detection['bbox'],
+            target_id=target_id
+        )
+        
+        # 可选：腐蚀mask
+        if args.erode_mask:
+            kernel_size = 5
+            mask_tensor = mask.float().unsqueeze(0).unsqueeze(0)
+            kernel = torch.ones(1, 1, kernel_size, kernel_size, device=mask_tensor.device)
+            mask_tensor = F.conv2d(F.pad(mask_tensor, (2, 2, 2, 2)), kernel)
+            mask = (mask_tensor == kernel_size * kernel_size).float().squeeze()
+            print("Mask已腐蚀")
+        
+        # 可视化mask
+        if args.visualize:
+            integrator.visualize_mask(
+                frame_idx=0,
+                mask=mask,
+                bbox=detection['bbox'],
+                title=f"目标 {target_id} - {detection['class_name']}",
+                save_path=Path(args.output_dir) / f"mask_target_{target_id}.png"
+            )
+        
+        # 使用TAPIP3D跟踪
         coords, visibs = integrator.track_with_tapip3d(
             mask=mask,
             grid_size=args.grid_size,
@@ -513,19 +596,24 @@ def main():
             vis_threshold=0.9
         )
         
+        # 保存结果
         result_path = integrator.save_results(
-            coords, visibs, mask, target_id, args.output_dir
+            coords, visibs, mask, target_id, args.output_dir,
+            detection_info=detection
         )
         results.append(result_path)
-
     
+    # 清理临时目录
     if temp_dir and Path(temp_dir).exists():
         shutil.rmtree(temp_dir)
-        print(f"cleaned up temporary directory {temp_dir}")
+        print(f"\n已清理临时目录: {temp_dir}")
     
     integrator.cleanup()
-
-
+    
+    print(f"\n{'='*60}")
+    print(f"全部完成！处理了 {len(results)} 个目标")
+    print(f"结果保存在: {args.output_dir}")
+    print(f"{'='*60}")
     
     return 0
 

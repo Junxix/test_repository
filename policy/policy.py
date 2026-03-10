@@ -1,25 +1,26 @@
-# policy/policy.py
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torchvision.transforms as transforms
+import numpy as np
 
 from policy.transformer import Transformer
 from policy.diffusion import DiffusionUNetPolicy
-from policy.sparse_modules import SparseEncoder, SpatialAligner
-from utils.constants import TRACK_MIN, TRACK_MAX
+from policy.tokenizer import Sparse3DEncoder, SparsePositionalEncoding
 from policy.track.model import TrackEncoder 
-import numpy as np
+from utils.constants import TRACK_MIN, TRACK_MAX
 
-# policy/policy.py
 class SemanticCrossAttentionMatcher(nn.Module):
     """
     两阶段Cross-Attention:
-    1. 第一阶段：基于语义相似度硬匹配物体对应关系（直接选最相似的）
+    1. 第一阶段：基于语义相似度匹配物体对应关系
     2. 第二阶段：在匹配的物体上做时序cross-attention
     """
     def __init__(self, hidden_dim, semantic_dim=1152, num_heads=4, dropout=0.1, temperature=0.1):
         super().__init__()
+        
+        # temperature for semantic matching (learnable or fixed)
+        self.temperature = nn.Parameter(torch.tensor(temperature))
         
         # temporal cross-attention (stage 2)
         self.temporal_cross_attention = nn.MultiheadAttention(
@@ -39,66 +40,68 @@ class SemanticCrossAttentionMatcher(nn.Module):
         )
         
         # for visualization
-        self._semantic_match_indices = None
-        self._similarity_matrix = None
+        self._semantic_match_weights = None
         self._temporal_attn_weights = None
 
     def _compute_semantic_matching(self, robot_sem, human_sem):
         """
-        Stage 1: hard matching based on semantic similarity (argmax, no learning)
+        Stage 1: compute object matching weights based on semantic similarity
         
         Args:
             robot_sem: (B, N_robot, D_sem)
             human_sem: (B, T, N_human, D_sem) or (B, N_human, D_sem)
         Returns:
-            match_indices: (B, N_robot) - index of best matching human target
-            similarity: (B, N_robot, N_human)
+            match_weights: (B, N_robot, N_human)
         """
         # aggregate human semantics over time if needed
+        # print(human_sem.shape)
+        # print(robot_sem.shape)
         if human_sem.dim() == 4:
+            # (B, T, N_human, D) -> (B, N_human, D) via mean pooling
             human_sem_agg = human_sem.mean(dim=1)
         else:
             human_sem_agg = human_sem
         
-        # print(human_sem.shape)
-        # L2 normalize for cosine similarity
+        # L2 normalize for cosine similarity (directly on original features)
         robot_sem_norm = F.normalize(robot_sem, dim=-1)
         human_sem_norm = F.normalize(human_sem_agg, dim=-1)
         
         # cosine similarity: (B, N_robot, N_human)
         similarity = torch.bmm(robot_sem_norm, human_sem_norm.transpose(1, 2))
         
-        # hard matching: select the most similar human target
-        match_indices = similarity.argmax(dim=-1)  # (B, N_robot)
+        # soft matching with temperature
+        match_weights = F.softmax(similarity / self.temperature, dim=-1)
         
-        return match_indices, similarity
+        return match_weights, similarity
 
-    def _reindex_by_matching(self, human_k, human_v, match_indices):
+    def _reindex_by_matching(self, human_k, human_v, match_weights):
         """
-        Reindex human K and V based on hard matching indices
+        Reindex human K and V based on semantic matching weights
         
         Args:
             human_k: (B, T, N_human, H)
             human_v: (B, T, N_human, H)
-            match_indices: (B, N_robot)
+            match_weights: (B, N_robot, N_human)
         Returns:
             matched_k: (B, T, N_robot, H)
             matched_v: (B, T, N_robot, H)
         """
-        B, T, N_human, H = human_k.shape
-        N_robot = match_indices.shape[1]
-        
-        # expand indices for gathering: (B, T, N_robot, H)
-        idx = match_indices[:, None, :, None].expand(B, T, N_robot, H)
-        
-        matched_k = torch.gather(human_k, dim=2, index=idx)
-        matched_v = torch.gather(human_v, dim=2, index=idx)
+        matched_k = torch.einsum('btnh, brn -> btrh', human_k, match_weights)
+        matched_v = torch.einsum('btnh, brn -> btrh', human_v, match_weights)
         
         return matched_k, matched_v
 
     def _temporal_attention(self, robot_query, matched_k, matched_v, human_mask=None):
         """
         Stage 2: temporal cross-attention for each robot target
+        
+        Args:
+            robot_query: (B, N_robot, H)
+            matched_k: (B, T, N_robot, H)
+            matched_v: (B, T, N_robot, H)
+            human_mask: (B, T) - True for padded positions
+        Returns:
+            output: (B, N_robot, H)
         """
         B, N_robot, H = robot_query.shape
         T = matched_k.shape[1]
@@ -107,12 +110,14 @@ class SemanticCrossAttentionMatcher(nn.Module):
         all_attn_weights = []
         
         for r in range(N_robot):
-            q = robot_query[:, r:r+1, :]
-            k = matched_k[:, :, r, :]
-            v = matched_v[:, :, r, :]
+            q = robot_query[:, r:r+1, :]  # (B, 1, H)
+            k = matched_k[:, :, r, :]      # (B, T, H)
+            v = matched_v[:, :, r, :]      # (B, T, H)
             
             out, attn_weights = self.temporal_cross_attention(
-                query=q, key=k, value=v,
+                query=q,
+                key=k,
+                value=v,
                 key_padding_mask=human_mask,
                 need_weights=True,
                 average_attn_weights=True
@@ -121,7 +126,7 @@ class SemanticCrossAttentionMatcher(nn.Module):
             outputs.append(out)
             all_attn_weights.append(attn_weights)
         
-        output = torch.cat(outputs, dim=1)
+        output = torch.cat(outputs, dim=1)  # (B, N_robot, H)
         
         if not self.training:
             self._temporal_attn_weights = torch.cat(all_attn_weights, dim=1)
@@ -129,65 +134,23 @@ class SemanticCrossAttentionMatcher(nn.Module):
         return output
 
     def _visualize_attention(self, save_path='attn_vis.png'):
-        """Visualize semantic matching indices and temporal attention"""
+        """Visualize both semantic matching and temporal attention"""
         import matplotlib.pyplot as plt
         
-        if self._similarity_matrix is None:
+        if self._semantic_match_weights is None:
             return
             
         fig, axes = plt.subplots(1, 2, figsize=(12, 4))
         
-        # show similarity matrix with hard matching marked
-        sim = self._similarity_matrix[0].detach().cpu().numpy()
-        indices = self._semantic_match_indices[0].detach().cpu().numpy()
-        
+        sem_weights = self._semantic_match_weights[0].detach().cpu().numpy()
         ax = axes[0]
-        im = ax.imshow(sim, aspect='auto', cmap='Blues')
-        # mark selected indices
-        for r, h in enumerate(indices):
-            ax.scatter(h, r, color='red', s=100, marker='x', linewidths=2)
+        im = ax.imshow(sem_weights, aspect='auto', cmap='Blues')
         ax.set_xlabel('Human Target')
         ax.set_ylabel('Robot Target')
-        ax.set_title('Semantic Similarity (X = selected)')
+        ax.set_title('Semantic Matching Weights')
         plt.colorbar(im, ax=ax)
         
         if self._temporal_attn_weights is not None:
-            # ============================================================
-            # 新增修改区域：在可视化时计算并输出所需的统计量
-            # self._temporal_attn_weights shape: (Batch, N_robot, T)
-            # ============================================================
-            # 使用 detach() 确保不影响计算图，虽然在可视化函数里通常已经是 no_grad 了
-            weights_tensor = self._temporal_attn_weights.detach()
-            
-            # 1. 计算每个target对应的attn的和 (沿时间维度 T 求和)
-            # Shape: (Batch, N_robot)
-            attn_sum_batch = weights_tensor.sum(dim=-1)
-            
-            # 2. 计算每个target对应的attn最大值所在的位置 t (沿时间维度 T 求 argmax)
-            # Shape: (Batch, N_robot)
-            max_attn_t_batch = weights_tensor.argmax(dim=-1)
-
-            # 为了输出清晰，我们只打印 Batch 中第一个样本 (Batch 0) 的统计信息
-            # 这与下面绘图只取 [0] 是一致的
-            B_idx = 0
-            num_robot_targets = weights_tensor.shape[1]
-            
-            print(f"\n--- [Attn Stats] Batch {B_idx} Temporal Attention Statistics ---")
-            print(f"Target ID | Max Attn at t | Sum Attn")
-            print("-" * 40)
-            for r in range(num_robot_targets):
-                # 获取最大值出现的时间步索引
-                t_idx = max_attn_t_batch[B_idx, r].item()
-                # 获取该 Target 的总注意力权重
-                total_attn = attn_sum_batch[B_idx, r].item()
-                
-                # (可选) 获取最大值本身，方便参考验证
-                # max_val = weights_tensor[B_idx, r, t_idx].item()
-                
-                print(f"Target {r:2d} | t = {t_idx:4d}      | {total_attn:.4f}")
-            print("-" * 40)
-            # ============================================================
-
             temp_weights = self._temporal_attn_weights[0].detach().cpu().numpy()
             ax = axes[1]
             im = ax.imshow(temp_weights, aspect='auto', cmap='Reds')
@@ -198,49 +161,48 @@ class SemanticCrossAttentionMatcher(nn.Module):
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved attention visualization to: {save_path}")
+        print(f"Saved: {save_path}")
         plt.close()
 
     def forward(self, robot_query, robot_sem, human_k, human_v, 
                 human_sem, human_mask=None):
         """
         Args:
-            robot_query: (B, N_robot, H)
-            robot_sem: (B, N_robot, D_sem)
-            human_k: (B, T, N_human, H)
-            human_v: (B, T, N_human, H)
-            human_sem: (B, T, N_human, D_sem)
-            human_mask: (B, T)
+            robot_query: (B, N_robot, H) - robot track embeddings
+            robot_sem: (B, N_robot, D_sem) - robot semantic features
+            human_k: (B, T, N_human, H) - human history track embeddings
+            human_v: (B, T, N_human, H) - human future track embeddings
+            human_sem: (B, T, N_human, D_sem) - human semantic features
+            human_mask: (B, T) - padding mask (True for padded)
         Returns:
             output: (B, N_robot, H)
         """
-        # Stage 1: Hard Semantic Matching (no gradient)
-        with torch.no_grad():
-            match_indices, similarity = self._compute_semantic_matching(robot_sem, human_sem)
+        # Stage 1: Semantic Matching
+        match_weights, similarity = self._compute_semantic_matching(robot_sem, human_sem)
         
         if not self.training:
-            self._semantic_match_indices = match_indices
-            self._similarity_matrix = similarity
+            self._semantic_match_weights = match_weights
         
-        # Reindex K and V by hard matching
-        matched_k, matched_v = self._reindex_by_matching(human_k, human_v, match_indices)
+        # Reindex K and V
+        matched_k, matched_v = self._reindex_by_matching(human_k, human_v, match_weights)
         
         # Stage 2: Temporal Cross-Attention
         attended = self._temporal_attention(robot_query, matched_k, matched_v, human_mask)
         
-        # FFN
+        #FFN
         output = self.norm(attended)
         output = self.ffn(output)
-        
         if not self.training:
             self._visualize_attention()
         
         return output
 
-class RISE(nn.Module):
+
+class HistRISE(nn.Module):
     def __init__(
         self, 
         num_action = 20,
+        num_history = 5,
         input_dim = 6,
         obs_feature_dim = 512, 
         action_dim = 10, 
@@ -248,34 +210,28 @@ class RISE(nn.Module):
         nheads = 8, 
         num_encoder_layers = 4, 
         num_decoder_layers = 1, 
-        num_attn_layers = 4,
         dim_feedforward = 2048, 
         dropout = 0.1,
         track_config=None,
-        num_targets = 2,
-        num_points = 10,
-        value_seq_len = 48  # value固定长度
+        num_targets=2,
+        num_points=10
     ):
         super().__init__()
         num_obs = 1
+        self.num_history = num_history
         self.num_targets = num_targets
         self.num_points = num_points
-        self.obs_feature_dim = obs_feature_dim
-        self.voxel_size = 0.005
-        self.value_seq_len = value_seq_len 
-        self.register_buffer('track_min', torch.tensor(TRACK_MIN, dtype=torch.float32))
-        self.register_buffer('track_max', torch.tensor(TRACK_MAX, dtype=torch.float32))
+        
+        # Point cloud encoder
+        self.sparse_encoder = Sparse3DEncoder(input_dim, obs_feature_dim)
 
-        # 1. Point Cloud Encoder
-        cloud_enc_dim = 128
-        self.track_enc_dim = 128
-        self.sparse_encoder = SparseEncoder(cloud_enc_dim=cloud_enc_dim, input_dim=input_dim)
-
-        # 2. Track Encoder for Key (Pretrained)
+        # Track encoder (只需要一个,human和robot共用)
         self.human_track_encoder = TrackEncoder(**track_config)
         track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/rel_train_all_track_encoder_mae/encoder_only_epoch_100_seed_42.ckpt"
+        # track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0106/rel_train_all_track_encoder_mae/encoder_only_epoch_26_seed_42.ckpt"
+        # track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0105/track_encoder_mae_aug_mask_05/encoder_only_epoch_52_seed_42.ckpt"
         if track_encoder_ckpt is not None:
-            print(f"[HistRISE] Loading pretrained track encoder (Key) from {track_encoder_ckpt}...")
+            print(f"[HistRISE] Loading pretrained track encoder from {track_encoder_ckpt}...")
             ckpt = torch.load(track_encoder_ckpt, map_location='cpu')
             state_dict = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
             state_dict = ckpt['model'] if 'model' in state_dict else state_dict
@@ -293,10 +249,11 @@ class RISE(nn.Module):
             for param in self.human_track_encoder.parameters():
                 param.requires_grad = False
             self.human_track_encoder.eval()
-
-        # 3. NEW: Track Encoder for Value (from different checkpoint)
+        track_output_dim = track_config['output_dim'] or track_config['query_dim']
+        # Value encoder (separate checkpoint, fixed window)
+        self.value_seq_len = 16
         self.human_value_encoder = TrackEncoder(**track_config)
-        value_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/human_track_encoder_mae_window48/encoder_human_window48_epoch_50_seed_42.ckpt" 
+        value_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/human_track_encoder_mae_window16/encoder_human_window16_epoch_50_seed_42.ckpt"
         if value_encoder_ckpt is not None:
             print(f"[HistRISE] Loading pretrained value encoder from {value_encoder_ckpt}...")
             ckpt = torch.load(value_encoder_ckpt, map_location='cpu')
@@ -307,7 +264,7 @@ class RISE(nn.Module):
             for k, v in state_dict.items():
                 if k.startswith('module.'): k = k[7:]
                 if k.startswith('human_track_encoder.') or k.startswith('human_value_encoder.'):
-                    new_key = k.split('.')[-1] if '.' in k else k
+                    new_key = k.split('.', 1)[1] if '.' in k else k
                     encoder_dict[new_key] = v
             if len(encoder_dict) == 0:
                 encoder_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
@@ -317,50 +274,102 @@ class RISE(nn.Module):
                 param.requires_grad = False
             self.human_value_encoder.eval()
 
-        track_output_dim = track_config['output_dim'] or track_config['query_dim']
-
-        self.human_track_fusion = nn.Linear(track_output_dim, self.track_enc_dim)
-        self.human_value_fusion = nn.Linear(track_output_dim, self.track_enc_dim)  # value单独的fusion层
+        self.human_value_fusion = nn.Linear(track_output_dim, hidden_dim)
+        # Track token fusion layers
+        self.human_track_fusion = nn.Linear(track_output_dim, hidden_dim)
+        # self.robot_track_fusion = nn.Linear(track_output_dim, hidden_dim)
         
-        # 4. Semantic Cross Attention Matcher
+        # 2. Semantic Matcher
+        # self.semantic_proj = nn.Linear(1152, hidden_dim) # SigLIP 映射
         semantic_dim = 1152
+        self.track_enc_dim = 512
         self.cross_attention_matcher = SemanticCrossAttentionMatcher(
             hidden_dim=self.track_enc_dim,
             semantic_dim=semantic_dim,
-            num_heads=4,
+            num_heads=4,  
             dropout=dropout
         )
-        
-        # 5. Spatial Aligner
-        aligner_input_dim = cloud_enc_dim + self.track_enc_dim
-        self.spatial_aligner = SpatialAligner(
-            mlps=[aligner_input_dim, aligner_input_dim, 256],
-            out_channels=obs_feature_dim, 
-            interp_fn_mode='custom'
-        )
-
-        # 6. Transformer & Decoder
+        # 3. Policy Headers
         self.transformer = Transformer(hidden_dim, nheads, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout)
         self.action_decoder = DiffusionUNetPolicy(action_dim, num_action, num_obs, obs_feature_dim)
         self.readout_embed = nn.Embedding(1, hidden_dim)
+        
+        # Type embedding: 0=point cloud, 1=human, 2=robot, 3=matched_embedding
+        self.type_embedding = nn.Embedding(4, hidden_dim)
+
+        self.robot_position_embedding = SparsePositionalEncoding(hidden_dim)
+        
+        self.register_buffer('track_min', torch.tensor(TRACK_MIN, dtype=torch.float32))
+        self.register_buffer('track_max', torch.tensor(TRACK_MAX, dtype=torch.float32))
+        self.voxel_size = 0.005
 
     def denormalize_tracks(self, normalized_tracks):
-        """Denormalize: [-1, 1] -> Absolute coordinates (Meters)"""
-        return (normalized_tracks + 1) / 2 * (self.track_max - self.track_min) + self.track_min        
-
-    def encode_human_key_value(self, human_tracks, human_track_lengths):
         """
-        Encode human trajectories for Key and Value separately
-        - Key: uses human_track_encoder, encodes 0 to t
-        - Value: uses human_value_encoder, encodes fixed 16 frames starting from t
+        反normalize tracks: [-1, 1] -> 原始绝对坐标（相机坐标系）
         
         Args:
-            human_tracks: (batch, T, num_targets*num_points, 3)
-            human_track_lengths: (batch,)
+            normalized_tracks: (..., 3) normalized coordinates
+            
         Returns:
-            human_k: (batch, T, num_targets, hidden_dim)
-            human_v: (batch, T, num_targets, hidden_dim)
+            tracks: (..., 3) absolute camera coordinates in meters
         """
+        return (normalized_tracks + 1) / 2 * (self.track_max - self.track_min) + self.track_min
+
+    def compute_robot_track_centers(self, robot_tracks, robot_effective_len):
+        """
+        计算每个target的聚类中心(通过最大点群的中心)
+        
+        Args:
+            robot_tracks: (batch, seq_len, num_targets*num_points, 3) - normalized
+            
+        Returns:
+            centers: (batch, num_targets, 3) - 原始坐标系下的中心
+        """
+        from sklearn.cluster import DBSCAN
+        
+        batch_size, seq_len = robot_tracks.shape[:2]
+        robot_tracks_reshaped = robot_tracks.reshape(batch_size, seq_len, self.num_targets, self.num_points, 3)
+        
+        # 反normalize
+        robot_tracks_denorm = self.denormalize_tracks(robot_tracks_reshaped)
+
+        target_indices = (robot_effective_len - 1).long()
+        batch_indices = torch.arange(batch_size, device=robot_tracks.device)
+        last_frame_tracks = robot_tracks_denorm[batch_indices, target_indices]
+
+        # 取最后一帧的点作为聚类依据
+        # last_frame_tracks = robot_tracks_denorm[:, -1]  # (batch, num_targets, num_points, 3)
+        
+        # 预分配numpy数组而不是list
+        centers = np.zeros((batch_size, self.num_targets, 3), dtype=np.float32)
+        
+        for b in range(batch_size):
+            for t in range(self.num_targets):
+                points = last_frame_tracks[b, t].cpu().numpy()  # (num_points, 3)
+                
+                # DBSCAN聚类
+                clustering = DBSCAN(eps=0.05, min_samples=2).fit(points)
+                labels = clustering.labels_
+                
+                # 找到最大的cluster
+                unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
+                if len(unique_labels) > 0:
+                    largest_cluster_label = unique_labels[np.argmax(counts)]
+                    cluster_points = points[labels == largest_cluster_label]
+                    center = cluster_points.mean(axis=0)
+                else:
+                    # 如果没有有效cluster，使用所有点的中心
+                    center = points.mean(axis=0)
+                
+                centers[b, t] = center
+        
+        # 直接从numpy array转换为tensor
+        centers = torch.from_numpy(centers).to(device=robot_tracks.device, dtype=robot_tracks.dtype)
+        
+        return centers
+
+
+    def encode_human_key_value(self, human_tracks, human_track_lengths):
         batch_size, T, total_pts, _ = human_tracks.shape
         device = human_tracks.device
         h_tracks = human_tracks.view(batch_size, T, self.num_targets, self.num_points, 3)
@@ -369,23 +378,21 @@ class RISE(nn.Module):
         all_key_lens, all_value_lens = [], []
 
         for t in range(T):
-            # Key: 0 to t trajectories (unchanged)
+            # Key: 0 to t (unchanged)
             k_t = h_tracks[:, :t+1].transpose(1, 2).reshape(batch_size * self.num_targets, t+1, self.num_points, 3)
             all_key_tracks.append(k_t)
             all_key_lens.append(torch.full((batch_size * self.num_targets,), t+1, device=device))
 
-            # Value: fixed 16 frames starting from t
+            # Value: fixed window of value_seq_len starting from t
             v_list = []
             v_len_list = []
             for b in range(batch_size):
                 act_len = human_track_lengths[b].item()
-                # Extract from t to min(t+16, act_len)
                 end_idx = min(t + self.value_seq_len, act_len)
-                curr_v = h_tracks[b, t:end_idx]  # (actual_len, num_targets, num_points, 3)
+                curr_v = h_tracks[b, t:end_idx] if t < act_len else h_tracks[b, act_len-1:act_len]
                 v_list.append(curr_v)
                 v_len_list.append(curr_v.size(0))
             
-            # Pad to value_seq_len
             v_padded = torch.zeros((batch_size, self.value_seq_len, self.num_targets, self.num_points, 3), device=device)
             for b, v_item in enumerate(v_list):
                 v_padded[b, :v_item.size(0)] = v_item
@@ -406,38 +413,20 @@ class RISE(nn.Module):
 
         # Encode Values with human_value_encoder
         def encode_values(track_list, len_list):
-            # All values have same padded length (value_seq_len)
-            flat_tracks = torch.cat(track_list, dim=0)  # (T*batch*targets, value_seq_len, points, 3)
-            
+            flat_tracks = torch.cat(track_list, dim=0)  # all have same padded length
             tokens = self.human_value_encoder(flat_tracks, lengths=torch.cat(len_list))
             embeds = self.human_value_fusion(tokens.view(tokens.size(0), -1, tokens.size(-1))).mean(dim=1)
             return embeds.view(T, batch_size, self.num_targets, -1).permute(1, 0, 2, 3)
 
         return encode_keys(all_key_tracks, all_key_lens), encode_values(all_value_tracks, all_value_lens)
 
+
     def encode_robot_query(self, robot_tracks, robot_track_lengths):
-        """
-        Encode robot tracks to generate query embeddings
-        Args:
-            robot_tracks: (batch, seq_len, num_targets, num_points, 3)
-            robot_track_lengths: (batch,)
-        Returns:
-            query_embeddings: (batch, num_targets, track_enc_dim)
-        """
-        batch_size, seq_len, num_targets, num_points, _ = robot_tracks.shape
-        device = robot_tracks.device
-        
-        robot_input = robot_tracks.transpose(1, 2).reshape(batch_size * num_targets, seq_len, num_points, 3)
-        lengths = robot_track_lengths.unsqueeze(1).expand(-1, num_targets).reshape(-1)
-        
-        tokens = self.human_track_encoder(robot_input, lengths=lengths)
-        _, num_points_enc, num_queries, dim = tokens.shape
-        tokens = tokens.view(batch_size * num_targets, num_points_enc * num_queries, dim)
-        tokens = self.human_track_fusion(tokens)
-        tokens = tokens.mean(dim=1)
-        
-        query_embeddings = tokens.view(batch_size, num_targets, -1)
-        return query_embeddings
+        tokens = self.human_track_encoder(robot_tracks, lengths=robot_track_lengths)
+        batch_size, num_pts_enc, num_q, dim = tokens.shape
+        tokens = self.human_track_fusion(tokens.view(batch_size, -1, dim))
+        # 还原 target 维度并取平均: (B, num_targets, num_points, D) -> (B, num_targets, D)
+        return tokens.reshape(batch_size, self.num_targets, self.num_points, -1).mean(dim=2)
 
 
     def compute_dense_human_embeddings(self, human_tracks, human_track_lengths):
@@ -462,17 +451,28 @@ class RISE(nn.Module):
         device = human_tracks.device
         all_embeddings = []
 
-
+        # 为了避免显存爆炸，我们逐个时间步或者小批次处理
+        # 这里采用逐个时间步循环处理 (Batch=1 * Num_Targets)
         for t in range(actual_len):
+            # 1. 截取从 t 到 结束 的轨迹
+            # shape: (future_len, num_targets, num_points, 3)
             track_segment = human_tracks[b, t:actual_len]
             future_len = track_segment.shape[0]
             
+            # 2. 构造 Encoder 输入
+            # 需要 reshape 成 (num_targets, future_len, num_points, 3)
+            # 因为 TrackEncoder 期望 (Batch, Seq, Points, Dim)
             encoder_input = track_segment.permute(1, 0, 2, 3) 
             
+            # 构造 lengths: (num_targets,)，所有 target 的长度都是 future_len
             lengths = torch.full((num_targets,), future_len, dtype=torch.long, device=device)
             
+            # 3. 通过 Encoder
+            # output: (num_targets, num_points, num_queries, dim)
             tokens = self.human_track_encoder(encoder_input, lengths=lengths)
             
+            # 4. Fusion & Pooling (保持和 encode_human_embedding_at_ratio 一致的逻辑)
+            # (num_targets, num_points * num_queries, dim)
             _, num_points_enc, num_queries, dim = tokens.shape
             tokens = tokens.view(num_targets, num_points_enc * num_queries, dim)
             tokens = self.human_track_fusion(tokens)
@@ -482,7 +482,7 @@ class RISE(nn.Module):
             
             all_embeddings.append(tokens)
             
-        # (T, num_targets, hidden_dim)
+        # 堆叠结果: (T, num_targets, hidden_dim)
         return torch.stack(all_embeddings, dim=0)
 
     def forward(self, cloud, actions=None, 
@@ -491,30 +491,25 @@ class RISE(nn.Module):
                 human_track_lengths=None, robot_track_lengths=None, 
                 human_semantics=None, robot_semantics=None, 
                 robot_total_length=None, batch_size=24):
+        
+        src, pos, src_padding_mask = self.sparse_encoder(cloud, batch_size=batch_size)
+        point_cloud_type_embed = self.type_embedding(
+            torch.zeros(batch_size, src.size(1), dtype=torch.long, device=src.device)
+        )
+        pos = pos + point_cloud_type_embed
 
-        T = human_tracks_abs.shape[1]   
-        human_tracks_abs = human_tracks_abs.view(batch_size, T, self.num_targets, self.num_points, 3)
-        human_tracks_rel = human_tracks_rel.view(batch_size, T, self.num_targets, self.num_points, 3)
-        robot_tracks_abs = robot_tracks_abs.view(batch_size, -1, self.num_targets, self.num_points, 3)
-        robot_tracks_rel = robot_tracks_rel.view(batch_size, -1, self.num_targets, self.num_points, 3)
 
-        # Step 1: Encode human key-value pairs
-        human_k, human_v = self.encode_human_key_value(
-            human_tracks_rel.view(batch_size, T, -1, 3), 
-            human_track_lengths
-        )  # (batch, T, num_targets, track_enc_dim)
+        human_k, human_v = self.encode_human_key_value(human_tracks_rel, human_track_lengths)
         
-        # Step 2: Encode robot query
-        robot_query = self.encode_robot_query(
-            robot_tracks_rel, 
-            robot_track_lengths
-        )  # (batch, num_targets, track_enc_dim)
+        robot_query = self.encode_robot_query(robot_tracks_rel, robot_track_lengths)
         
-        # Step 3: Create human mask
-        range_tensor = torch.arange(T, device=cloud.F.device).unsqueeze(0).expand(batch_size, -1)
-        h_mask = range_tensor >= human_track_lengths.unsqueeze(1)  # (batch, T)
+        # Human Mask
+        T = human_k.size(1)
+        range_tensor = torch.arange(T, device=src.device).unsqueeze(0).expand(batch_size, -1)
+        h_mask = range_tensor >= human_track_lengths.unsqueeze(1)
         
-        # Step 4
+        # 执行匹配：用 Robot Query 去查 Human Key，取对应的 Value
+        # Step 4: 语义增强的Cross Attention（无需for循环！）
         matched_embedding = self.cross_attention_matcher(
             robot_query=robot_query,
             robot_sem=robot_semantics,  # (batch, num_targets, semantic_dim)
@@ -523,117 +518,193 @@ class RISE(nn.Module):
             human_sem=human_semantics,  # (batch, T, num_targets, semantic_dim)
             human_mask=h_mask
         )  # (batch, num_targets, track_enc_dim)
-
-        # if not self.training:
-        #     step_idx = 0
-        #     scene_id = 3
-        #     import matplotlib.pyplot as plt
-        #     import os
-        #     import torch.nn.functional as F
-            
-
-        #     human_tracks_rel = human_tracks_rel.view(batch_size, T, self.num_targets, self.num_points, 3)
-        #     robot_tracks_rel = robot_tracks_rel.view(batch_size, -1, self.num_targets, self.num_points, 3)
-            
-        #     print("robot_tracks_rel.shape", robot_tracks_rel.shape)
-        #     print("human_tracks_rel.shape", human_tracks_rel.shape)
-        #     # robot_seq_len = robot_tracks_rel.shape[1]
-        #     # robot_lengths = torch.full((batch_size,), robot_seq_len, dtype=torch.long, device=cloud.device)
-        #     # dense_robot_embeddings = self.compute_dense_robot_embeddings(robot_tracks_rel, robot_lengths)
-        #     # dense_embeddings = dense_robot_embeddings
-        #     dense_embeddings = self.compute_dense_human_embeddings(human_tracks_rel, human_track_lengths)
+        # print("matched_embedding.shape", matched_embedding.shape)
 
 
-        #     print(dense_embeddings)
+        if not self.training:
+            step_idx = 0
+            scene_id = 3
+            import matplotlib.pyplot as plt
+            import os
+            import torch.nn.functional as F
+            
 
-        #     vis_T = dense_embeddings.shape[0]
-        #     num_targets = self.num_targets
-        #     hidden_dim = dense_embeddings.shape[-1]
+            human_tracks_rel = human_tracks_rel.view(batch_size, T, self.num_targets, self.num_points, 3)
+            robot_tracks_rel = robot_tracks_rel.view(batch_size, -1, self.num_targets, self.num_points, 3)
             
-        #     save_dir = "vis_target_time_matrix"
-        #     os.makedirs(save_dir, exist_ok=True)
-        #     npy_save_path = os.path.join(save_dir, f'dense_embeddings_scene_epoch_76_{scene_id:04d}.npy')
-        #     np.save(npy_save_path, dense_embeddings.detach().cpu().numpy())
-        #     print(f"[Vis] Saved embeddings to {npy_save_path}")
+            print("robot_tracks_rel.shape", robot_tracks_rel.shape)
+            print("human_tracks_rel.shape", human_tracks_rel.shape)
+            # robot_seq_len = robot_tracks_rel.shape[1]
+            # robot_lengths = torch.full((batch_size,), robot_seq_len, dtype=torch.long, device=cloud.device)
+            # dense_robot_embeddings = self.compute_dense_robot_embeddings(robot_tracks_rel, robot_lengths)
+            # dense_embeddings = dense_robot_embeddings
+            dense_embeddings = self.compute_dense_human_embeddings(human_tracks_rel, human_track_lengths)
 
-        #     # 1. 调整维度顺序：(Num_Targets, T, Dim)
-        #     # dense_embeddings 是 (T, Targets, Dim)，permute 成 (Targets, T, Dim)
-        #     all_keys = dense_embeddings.permute(1, 0, 2).contiguous()
+            # ========== 1. Robot Query vs Human Key 相似度可视化 ==========
+            # robot_query shape: (batch, num_targets, hidden_dim)
+            # human_k shape: (batch, T_human, num_targets, hidden_dim)
             
-        #     # 3. 展平: (Num_Targets * T, Dim)
-        #     flat_keys = all_keys.view(-1, hidden_dim)
+            robot_query_vis = robot_query[0]  # (num_targets, hidden_dim)
+            human_k_vis = human_k[0]  # (T_human, num_targets, hidden_dim)
+            T_human = human_k_vis.shape[0]
             
-        #     # 4. 归一化以便计算余弦相似度
-        #     flat_keys_norm = F.normalize(flat_keys, p=2, dim=1)
+            # 创建保存目录
+            save_dir = "vis_robot_human_similarity"
+            os.makedirs(save_dir, exist_ok=True)
             
-        #     # 5. 计算相似度矩阵 ((Num_Targets*T) x (Num_Targets*T))
-        #     sim_matrix = torch.mm(flat_keys_norm, flat_keys_norm.t()).detach().cpu().numpy()
+            # 可视化 Robot Query vs Human Key
+            fig, axes = plt.subplots(1, self.num_targets, figsize=(8*self.num_targets, 4))
+            if self.num_targets == 1:
+                axes = [axes]
             
-        #     # 6. 绘图
-        #     plt.figure(figsize=(14, 12))
-        #     im = plt.imshow(sim_matrix, cmap='viridis', vmin=0.0, vmax=1.0)
-        #     plt.colorbar(im, label='Cosine Similarity')
+            for target_idx in range(self.num_targets):
+                # 提取当前target的embeddings
+                robot_q = robot_query_vis[target_idx:target_idx+1, :]  # (1, hidden_dim)
+                human_k_target = human_k_vis[:, target_idx, :]  # (T_human, hidden_dim)
+                
+                # 归一化
+                robot_q_norm = F.normalize(robot_q, p=2, dim=1)  # (1, hidden_dim)
+                human_k_norm = F.normalize(human_k_target, p=2, dim=1)  # (T_human, hidden_dim)
+                
+                # 计算相似度: (1, T_human)
+                similarity = torch.matmul(robot_q_norm, human_k_norm.T)
+                similarity = (similarity + 1) / 2  # [-1,1] -> [0,1]
+                similarity = similarity.squeeze(0).detach().cpu().numpy()  # (T_human,)
+                
+                # 保存数据
+                npy_path = os.path.join(save_dir, f'query_similarity_target_{target_idx}_scene_{scene_id:04d}.npy')
+                np.save(npy_path, similarity)
+                
+                # 绘制折线图
+                ax = axes[target_idx]
+                ax.plot(range(T_human), similarity, 'b-', linewidth=2, label='Similarity')
+                ax.fill_between(range(T_human), similarity, alpha=0.3)
+                
+                # 标注最大值
+                max_idx = similarity.argmax()
+                max_val = similarity[max_idx]
+                ax.plot(max_idx, max_val, 'r*', markersize=15, 
+                    label=f'Max: {max_val:.3f} at t={max_idx}')
+                
+                ax.set_xlabel('Human Time Step', fontsize=12)
+                ax.set_ylabel('Cosine Similarity [0-1]', fontsize=12)
+                ax.set_title(f'Target {target_idx+1}\nRobot Query vs Human Key', fontsize=14)
+                ax.set_ylim([0, 1])
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
+                print(f"[Target {target_idx}] Robot Query vs Human Key:")
+                print(f"  Max: {max_val:.4f} at Human_t={max_idx}")
+                print(f"  Mean: {similarity.mean():.4f}")
             
-        #     # 7. 画白色网格线区分不同的 Target
-        #     for i in range(1, num_targets):
-        #         boundary = i * vis_T - 0.5 
-        #         plt.axhline(y=boundary, color='white', linestyle='--', linewidth=1, alpha=0.7)
-        #         plt.axvline(x=boundary, color='white', linestyle='--', linewidth=1, alpha=0.7)
+            plt.tight_layout()
+            fig_path = os.path.join(save_dir, f'query_similarity_scene_{scene_id:04d}_step_{step_idx:04d}.png')
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"[Vis] Saved robot query similarity to {fig_path}")
+
+            print(dense_embeddings)
+
+            vis_T = dense_embeddings.shape[0]
+            num_targets = self.num_targets
+            hidden_dim = dense_embeddings.shape[-1]
             
-        #     # 8. 设置刻度
-        #     tick_locs = []
-        #     tick_labels = []
-        #     tick_interval = 10 
+            save_dir = "vis_target_time_matrix"
+            os.makedirs(save_dir, exist_ok=True)
+            npy_save_path = os.path.join(save_dir, f'dense_embeddings_scene_epoch_76_{scene_id:04d}.npy')
+            np.save(npy_save_path, dense_embeddings.detach().cpu().numpy())
+            print(f"[Vis] Saved embeddings to {npy_save_path}")
+
+            # 1. 调整维度顺序：(Num_Targets, T, Dim)
+            # dense_embeddings 是 (T, Targets, Dim)，permute 成 (Targets, T, Dim)
+            all_keys = dense_embeddings.permute(1, 0, 2).contiguous()
             
-        #     for i in range(num_targets):
-        #         start_idx = i * vis_T
-        #         for t in range(0, vis_T, tick_interval):
-        #             tick_locs.append(start_idx + t)
-        #             tick_labels.append(str(t))
+            # 3. 展平: (Num_Targets * T, Dim)
+            flat_keys = all_keys.view(-1, hidden_dim)
             
-        #     plt.xticks(tick_locs, tick_labels, rotation=90, fontsize=8)
-        #     plt.yticks(tick_locs, tick_labels, fontsize=8)
+            # 4. 归一化以便计算余弦相似度
+            flat_keys_norm = F.normalize(flat_keys, p=2, dim=1)
             
-        #     plt.xlabel('Time Step (Target 1 -> Target N)')
-        #     plt.ylabel('Time Step (Target 1 -> Target N)')
+            # 5. 计算相似度矩阵 ((Num_Targets*T) x (Num_Targets*T))
+            sim_matrix = torch.mm(flat_keys_norm, flat_keys_norm.t()).detach().cpu().numpy()
             
-        #     plt.title(f'Target-Time Joint Similarity Matrix\n(Block Size: {vis_T}x{vis_T})\nStep: {step_idx}')
+            # 6. 绘图
+            plt.figure(figsize=(14, 12))
+            im = plt.imshow(sim_matrix, cmap='viridis', vmin=0.0, vmax=1.0)
+            plt.colorbar(im, label='Cosine Similarity')
             
-        #     plt.tight_layout()
-        #     plt.savefig(f'{save_dir}/matrix_step_{step_idx:04d}.png', dpi=150)
-        #     plt.close()
-        #     print(f"[Vis] Saved matrix to {save_dir}/matrix_step_{step_idx:04d}.png")
-        # # ====================================================================
-        # Step 5: Get robot track coordinates for spatial interpolation
-        robot_tracks_meters = self.denormalize_tracks(robot_tracks_abs)
-        
+            # 7. 画白色网格线区分不同的 Target
+            for i in range(1, num_targets):
+                boundary = i * vis_T - 0.5 
+                plt.axhline(y=boundary, color='white', linestyle='--', linewidth=1, alpha=0.7)
+                plt.axvline(x=boundary, color='white', linestyle='--', linewidth=1, alpha=0.7)
+            
+            # 8. 设置刻度
+            tick_locs = []
+            tick_labels = []
+            tick_interval = 10 
+            
+            for i in range(num_targets):
+                start_idx = i * vis_T
+                for t in range(0, vis_T, tick_interval):
+                    tick_locs.append(start_idx + t)
+                    tick_labels.append(str(t))
+            
+            plt.xticks(tick_locs, tick_labels, rotation=90, fontsize=8)
+            plt.yticks(tick_locs, tick_labels, fontsize=8)
+            
+            plt.xlabel('Time Step (Target 1 -> Target N)')
+            plt.ylabel('Time Step (Target 1 -> Target N)')
+            
+            plt.title(f'Target-Time Joint Similarity Matrix\n(Block Size: {vis_T}x{vis_T})\nStep: {step_idx}')
+            
+            plt.tight_layout()
+            plt.savefig(f'{save_dir}/matrix_step_{step_idx:04d}.png', dpi=150)
+            plt.close()
+            print(f"[Vis] Saved matrix to {save_dir}/matrix_step_{step_idx:04d}.png")
+        # ====================================================================
+
+        # 3. 位置编码与融合 (保持原代码逻辑)
         if robot_track_lengths is not None:
-            robot_effective_len = robot_track_lengths.float()
+            robot_effective_len = robot_track_lengths.float()  # (batch,)
         else:
-            robot_current_len = robot_tracks_abs.shape[1]
             robot_effective_len = torch.full((batch_size,), robot_current_len, 
-                                           dtype=torch.float32, device=cloud.F.device)
+                                            dtype=torch.float32, device=src.device)
+        robot_centers = self.compute_robot_track_centers(robot_tracks_abs, robot_effective_len)
+        robot_coords_voxel = (robot_centers / self.voxel_size).long()  # (batch, num_targets, 3)
+        
+        # 为每个batch的每个target生成位置编码
+        robot_pos_list = []
+        for b in range(batch_size):
+            batch_coords = robot_coords_voxel[b]  # (num_targets, 3)
+            # 构造coords_list格式: 每个元素是 (N, 4), 其中第一列是batch_id
+            coords_with_batch = torch.cat([
+                torch.zeros(self.num_targets, 1, dtype=torch.long, device=batch_coords.device),
+                batch_coords
+            ], dim=1)  # (num_targets, 4)
+            
+            batch_pos = self.robot_position_embedding([coords_with_batch])  # list of (num_targets, hidden_dim)
+            robot_pos_list.append(batch_pos[0])
+        
+        robot_pos = torch.stack(robot_pos_list, dim=0)  # (batch, num_targets, hidden_dim)
+        
+        matched_type_embed = self.type_embedding(
+            torch.full((batch_size, self.num_targets), 3, dtype=torch.long, device=src.device)
+        )
 
-        target_indices = (robot_effective_len - 1).long()
-        batch_indices = torch.arange(batch_size, device=cloud.F.device)
-        current_robot_tracks = robot_tracks_meters[batch_indices, target_indices]
+        matched_pos = matched_type_embed + robot_pos
+        matched_embedding = matched_embedding + robot_pos
 
-        track_coords_meters = current_robot_tracks.view(batch_size, -1, 3)
-        track_coords_voxel = track_coords_meters / self.voxel_size
-
-        # Step 6: Expand matched_embedding to points as track_feats
-        track_feats = matched_embedding.unsqueeze(2).repeat(1, 1, self.num_points, 1)
-        track_feats = track_feats.view(batch_size, -1, self.track_enc_dim)
-
-        # Transpose for aligner: (B, Dim, N)
-        track_coords_voxel = track_coords_voxel.transpose(1, 2).contiguous() 
-        track_feats = track_feats.transpose(1, 2).contiguous() 
-
-        # Step 7: Spatial alignment
-        cloud_feat = self.sparse_encoder(cloud)
-        src, pos, src_padding_mask = self.spatial_aligner(cloud_feat, track_feats, track_coords_voxel)
-
-        # Step 8: Transformer & action prediction
+        src = torch.cat([src, matched_embedding], dim=1)
+        pos = torch.cat([pos, matched_pos], dim=1)
+        
+        matched_padding_mask = torch.zeros(
+            (batch_size, self.num_targets),
+            dtype=torch.bool, device=src.device
+        )
+        src_padding_mask = torch.cat([src_padding_mask, matched_padding_mask], dim=1)
+        
+        # Transformer + Action Decoder
         readout = self.transformer(src, src_padding_mask, self.readout_embed.weight, pos)[-1]
         readout = readout[:, 0]
         
@@ -646,8 +717,7 @@ class RISE(nn.Module):
             return action_pred
 
     def train(self, mode=True):
-        """Override train to keep both encoders in eval mode"""
         super().train(mode)
         self.human_track_encoder.eval()
-        self.human_value_encoder.eval()  # Also freeze value encoder
+        self.human_value_encoder.eval()
         return self

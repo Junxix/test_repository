@@ -12,14 +12,11 @@ class SceneAnnotationTool:
         self.user_id = user_id
         self.cam_id = cam_id
         self.type_mapping = {
-            '1': 'cup+block',
-            '2': 'block+cup',
-            '3': 'doll+block',
-            '4': 'block+doll',
-            '5': 'doll+lego',
-            '6': 'lego+doll',
-            '7': 'doll+cup',
-            '8': 'cup+doll'
+            '1': 'box',
+            '2': 'block',
+            '3': 'cup',
+            '4': 'doll',
+            '5': 'yellow'
         }
         
     def get_scene_path(self, scene_num):
@@ -56,14 +53,11 @@ class SceneAnnotationTool:
         # 类型选项
         y_start = 90
         types = [
-            "1: cup+block",
-            "2: block+cup", 
-            "3: doll+block",
-            "4: block+doll",
-            "5: doll+lego",
-            "6: lego+doll",
-            "7: doll+cup",
-            "8: cup+doll"
+            "1: box",
+            "2: block", 
+            "3: cup",
+            "4: doll",
+            "5: yellow"
         ]
         
         for i, type_text in enumerate(types):
@@ -73,7 +67,7 @@ class SceneAnnotationTool:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 100, 200), 2)
         
         # 操作说明
-        cv2.putText(panel, "Press 1-8: Select type  |  N: Next scene  |  Q: Quit", 
+        cv2.putText(panel, "Press 1-5: Select type  |  N: Next scene  |  Q: Quit", 
                    (20, height - 20),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1)
         
@@ -169,7 +163,7 @@ class SceneAnnotationTool:
                     return 'next'
                 else:
                     print("请先选择类型 (1-5)")
-            elif chr(key) in ['1', '2', '3', '4', '5', '6', '7', '8']:
+            elif chr(key) in ['1', '2', '3', '4', '5']:
                 current_type = chr(key)
                 type_name = self.type_mapping[current_type]
                 print(f"已选择类型: {current_type} ({type_name})")
@@ -209,9 +203,9 @@ if __name__ == "__main__":
     # 根据你的实际路径修改以下参数
     
     # 示例1: /data/jingjing/data/context/realdata_sampled_20251110/train/task_0103_user_0555_scene_0001_cfg_0001/cam_104122063550
-    base_path = "/data/jingjing/data/context/realdata_sampled_20260109/train"
-    task_id = "task_0105"
-    user_id = "user_0999"
+    base_path = "/data/jingjing/data/context/realdata_sampled_20251111/train"
+    task_id = "task_0103"
+    user_id = "user_0555"
     cam_id = "cam_104122063550"
     
     # 示例2: 如果是不同的日期或路径
@@ -232,4 +226,4 @@ if __name__ == "__main__":
     tool = SceneAnnotationTool(base_path, task_id, user_id, cam_id)
     
     # 运行标注，从scene_0001到scene_0050
-    tool.run(start_scene=1, end_scene=5)
+    tool.run(start_scene=51, end_scene=99)

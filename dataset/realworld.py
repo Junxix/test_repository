@@ -632,21 +632,21 @@ class RealWorldDataset(Dataset):
         projector = self.projectors[timestamp]
 
         # create color jitter
-        # if self.split == 'train' and self.aug_jitter:
-        #     jitter = T.ColorJitter(
-        #         brightness = self.aug_jitter_params[0],
-        #         contrast = self.aug_jitter_params[1],
-        #         saturation = self.aug_jitter_params[2],
-        #         hue = self.aug_jitter_params[3]
-        #     )
-        #     jitter = T.RandomApply([jitter], p = self.aug_jitter_prob)
+        if self.split == 'train' and self.aug_jitter:
+            jitter = T.ColorJitter(
+                brightness = self.aug_jitter_params[0],
+                contrast = self.aug_jitter_params[1],
+                saturation = self.aug_jitter_params[2],
+                hue = self.aug_jitter_params[3]
+            )
+            jitter = T.RandomApply([jitter], p = self.aug_jitter_prob)
 
         colors_list = []
         depths_list = []
         for frame_id in obs_frame_ids:
             colors = Image.open(os.path.join(color_dir, "{}.png".format(frame_id)))
-            # if self.split == 'train' and self.aug_jitter:
-            #     colors = jitter(colors)
+            if self.split == 'train' and self.aug_jitter:
+                colors = jitter(colors)
             colors_list.append(colors)
             depths_list.append(
                 np.array(Image.open(os.path.join(depth_dir, "{}.png".format(frame_id))), dtype = np.float32)
@@ -864,8 +864,6 @@ class RealWorldDataset(Dataset):
         human_tracks_rel_tensor = torch.from_numpy(full_human_tracks_rel).float()
         robot_tracks_abs_tensor = torch.from_numpy(full_robot_tracks_abs).float()
         robot_tracks_rel_tensor = torch.from_numpy(full_robot_tracks_rel).float()
-        # print(human_semantics.shape)
-        # print(robot_semantics.shape)
         human_semantics_tensor = torch.from_numpy(human_semantics[0,:,:]).float()
         # robot_semantics_tensor = torch.from_numpy(robot_semantics[:, end_idx-1, :]).float()
         robot_semantics_tensor = torch.from_numpy(robot_semantics[:, 0, :]).float()

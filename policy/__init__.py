@@ -1,1 +1,1 @@
-from policy.policy import RISE
+from policy.policy import HistRISE

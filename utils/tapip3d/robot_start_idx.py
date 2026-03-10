@@ -131,6 +131,6 @@ def batch_update(root_dir):
     print("="*60)
 
 if __name__ == "__main__":
-    root_dir = "/data/jingjing/data/context/realdata_sampled_20260109/train"
+    root_dir = "/data/jingjing/data/context/realdata_sampled_mismatch_separate_2/train"
     batch_update(root_dir)
 

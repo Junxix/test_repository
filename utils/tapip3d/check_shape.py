@@ -17,14 +17,14 @@ def check_paired_first_dim_consistency(base_dir, camera_name='cam_104122063550')
             'siglip_dir': 'robot_siglip',
             'tracks_dir': 'after_sam2_tapip3d_results_offline',
             'siglip_pattern': 'target_{}.npy',
-            'tracks_pattern': '3d_tracks_target_after_{}.npy'
+            'tracks_pattern': '3d_tracks_target_{}.npy'
         },
         {
             'name': 'human配对',
             'siglip_dir': 'human_siglip',
             'tracks_dir': 'before_sam2_tapip3d_results_offline',
             'siglip_pattern': 'target_{}.npy',
-            'tracks_pattern': '3d_tracks_target_before_{}.npy'
+            'tracks_pattern': '3d_tracks_target_{}.npy'
         }
     ]
     
@@ -135,5 +135,5 @@ def check_paired_first_dim_consistency(base_dir, camera_name='cam_104122063550')
     return inconsistent_cases
 
 # 使用示例
-base_dir = "/data/jingjing/data/context/realdata_sampled_20260107_mismatch/train"
+base_dir = "/data/jingjing/data/context/realdata_sampled_mismatch_separate_2/train"
 inconsistent = check_paired_first_dim_consistency(base_dir, camera_name='cam_104122063550')
