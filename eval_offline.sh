@@ -5,4 +5,7 @@ python eval_offline.py \
     --max_test_steps 200 \
     --vis  \
     --scene_filter  "task_0108_user_0555_scene_0003_cfg_0001_BEFORE_task_0108_user_0555_scene_0003_cfg_0001_AFTER" \
+    --track_encoder_ckpt /data/jingjing/chkpts/su2/rise/task_0107/rel_train_all_track_encoder_mae/encoder_only_epoch_100_seed_42.ckpt \
+    --value_encoder_ckpt /data/jingjing/chkpts/su2/rise/task_0107/human_track_encoder_mae_window16/encoder_human_window16_epoch_50_seed_42.ckpt \
+    --value_seq_len 16 \
     --save_results

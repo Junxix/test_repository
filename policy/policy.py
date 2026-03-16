@@ -214,7 +214,10 @@ class HistRISE(nn.Module):
         dropout = 0.1,
         track_config=None,
         num_targets=2,
-        num_points=10
+        num_points=10,
+        track_encoder_ckpt=None,       # new
+        value_encoder_ckpt=None,       # new
+        value_seq_len=16               # new
     ):
         super().__init__()
         num_obs = 1
@@ -225,11 +228,9 @@ class HistRISE(nn.Module):
         # Point cloud encoder
         self.sparse_encoder = Sparse3DEncoder(input_dim, obs_feature_dim)
 
-        # Track encoder (只需要一个,human和robot共用)
+        # Track encoder
         self.human_track_encoder = TrackEncoder(**track_config)
-        track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/rel_train_all_track_encoder_mae/encoder_only_epoch_100_seed_42.ckpt"
-        # track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0106/rel_train_all_track_encoder_mae/encoder_only_epoch_26_seed_42.ckpt"
-        # track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0105/track_encoder_mae_aug_mask_05/encoder_only_epoch_52_seed_42.ckpt"
+        # track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/rel_train_all_track_encoder_mae/encoder_only_epoch_100_seed_42.ckpt"
         if track_encoder_ckpt is not None:
             print(f"[HistRISE] Loading pretrained track encoder from {track_encoder_ckpt}...")
             ckpt = torch.load(track_encoder_ckpt, map_location='cpu')
@@ -251,9 +252,9 @@ class HistRISE(nn.Module):
             self.human_track_encoder.eval()
         track_output_dim = track_config['output_dim'] or track_config['query_dim']
         # Value encoder (separate checkpoint, fixed window)
-        self.value_seq_len = 16
+        self.value_seq_len = value_seq_len
         self.human_value_encoder = TrackEncoder(**track_config)
-        value_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/human_track_encoder_mae_window16/encoder_human_window16_epoch_50_seed_42.ckpt"
+        # value_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/human_track_encoder_mae_window16/encoder_human_window16_epoch_50_seed_42.ckpt"
         if value_encoder_ckpt is not None:
             print(f"[HistRISE] Loading pretrained value encoder from {value_encoder_ckpt}...")
             ckpt = torch.load(value_encoder_ckpt, map_location='cpu')
@@ -277,7 +278,6 @@ class HistRISE(nn.Module):
         self.human_value_fusion = nn.Linear(track_output_dim, hidden_dim)
         # Track token fusion layers
         self.human_track_fusion = nn.Linear(track_output_dim, hidden_dim)
-        # self.robot_track_fusion = nn.Linear(track_output_dim, hidden_dim)
         
         # 2. Semantic Matcher
         # self.semantic_proj = nn.Linear(1152, hidden_dim) # SigLIP 映射
@@ -317,8 +317,6 @@ class HistRISE(nn.Module):
 
     def compute_robot_track_centers(self, robot_tracks, robot_effective_len):
         """
-        计算每个target的聚类中心(通过最大点群的中心)
-        
         Args:
             robot_tracks: (batch, seq_len, num_targets*num_points, 3) - normalized
             
@@ -330,16 +328,12 @@ class HistRISE(nn.Module):
         batch_size, seq_len = robot_tracks.shape[:2]
         robot_tracks_reshaped = robot_tracks.reshape(batch_size, seq_len, self.num_targets, self.num_points, 3)
         
-        # 反normalize
         robot_tracks_denorm = self.denormalize_tracks(robot_tracks_reshaped)
 
         target_indices = (robot_effective_len - 1).long()
         batch_indices = torch.arange(batch_size, device=robot_tracks.device)
         last_frame_tracks = robot_tracks_denorm[batch_indices, target_indices]
 
-        # 取最后一帧的点作为聚类依据
-        # last_frame_tracks = robot_tracks_denorm[:, -1]  # (batch, num_targets, num_points, 3)
-        
         # 预分配numpy数组而不是list
         centers = np.zeros((batch_size, self.num_targets, 3), dtype=np.float32)
         

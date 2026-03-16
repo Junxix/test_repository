@@ -46,6 +46,10 @@ default_args = edict({
     "output_dir": "./eval_results",
     "num_targets": 4,
     "num_points": 10,
+    "num_targets": 4,
+    "track_encoder_ckpt": None,    # new
+    "value_encoder_ckpt": None,    # new
+    "value_seq_len": 16,    
 })
 
 
@@ -151,7 +155,10 @@ class OfflineEvaluator:
             dropout=self.args.dropout,
             track_config=track_config,
             num_targets=self.args.num_targets,
-            num_points=self.args.num_points
+            num_targets = args.num_targets,
+            track_encoder_ckpt = args.track_encoder_ckpt,   # new
+            value_encoder_ckpt = args.value_encoder_ckpt,   # new
+            value_seq_len = args.value_seq_len
         ).to(self.device)
         
 
@@ -381,6 +388,9 @@ if __name__ == '__main__':
     
     parser.add_argument('--num_targets', type=int, default=4, help='Number of targets')
     parser.add_argument('--num_points', type=int, default=10, help='Number of points per target')
-    
+    parser.add_argument('--track_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--value_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--value_seq_len', type=int, default=16)
+
     args = parser.parse_args()
     main(vars(args))

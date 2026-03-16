@@ -42,7 +42,10 @@ default_args = edict({
     "num_workers": 24,
     "seed": 233,
     "vis_data": False,
-    "num_targets": 4
+    "num_targets": 4,
+    "track_encoder_ckpt": None,    # new
+    "value_encoder_ckpt": None,    # new
+    "value_seq_len": 16,           # new
 })
 
 
@@ -125,7 +128,10 @@ def train(args_override):
         num_decoder_layers = args.num_decoder_layers,
         dropout = args.dropout,
         track_config = track_config,
-        num_targets = args.num_targets
+        num_targets = args.num_targets,
+        track_encoder_ckpt = args.track_encoder_ckpt,   # new
+        value_encoder_ckpt = args.value_encoder_ckpt,   # new
+        value_seq_len = args.value_seq_len
     ).to(device)
     
     if RANK == 0:
@@ -292,5 +298,8 @@ if __name__ == '__main__':
     parser.add_argument('--seed', action = 'store', type = int, help = 'seed', required = False, default = 233)
     parser.add_argument('--vis_data', action = 'store_true', help = 'whether to visualize the input data and ground truth actions.')
     parser.add_argument('--num_targets', action = 'store', type = int, help = 'number of targets to use', required = False, default = 3)
-
+    parser.add_argument('--track_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--value_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--value_seq_len', type=int, default=16)
+    
     train(vars(parser.parse_args()))
