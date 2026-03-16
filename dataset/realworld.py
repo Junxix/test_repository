@@ -308,25 +308,19 @@ class RealWorldDataset(Dataset):
         Returns:
             augmented_tracks_rel: (T, N, 3) - augmented normalized relative tracks
         """
-        # 1. Denormalize到相对坐标（米）
         from utils.constants import REL_TRACK_MIN, REL_TRACK_MAX
         tracks_rel_denorm = (tracks_rel + 1) / 2 * (REL_TRACK_MAX - REL_TRACK_MIN) + REL_TRACK_MIN
         
-        # 2. 保存原始shape
         original_shape = tracks_rel_denorm.shape  # (T, N, 3)
         
-        # 3. Reshape成2D: (T*N, 3)
+        # (T*N, 3)
         tracks_flat = tracks_rel_denorm.reshape(-1, 3)  # (T*N, 3)
         
-        # 4. 只应用旋转变换（相对位移不受平移影响）
-        # 提取aug_mat的旋转部分
         rot_mat = aug_mat[:3, :3]
         tracks_flat = (rot_mat @ tracks_flat.T).T
-        
-        # 5. Reshape回原始shape
+
         tracks_rel_denorm = tracks_flat.reshape(original_shape)
         
-        # 6. Normalize回[-1, 1]
         tracks_rel_normalized = (tracks_rel_denorm - REL_TRACK_MIN) / (REL_TRACK_MAX - REL_TRACK_MIN) * 2 - 1
         tracks_rel_normalized = np.clip(tracks_rel_normalized, -1.0, 1.0)
         
@@ -365,18 +359,14 @@ class RealWorldDataset(Dataset):
         sampled_indices = np.zeros(n_samples, dtype=np.int32)
         distances = np.ones(N) * 1e10
         
-        # 随机选择第一个点
         # farthest = np.random.randint(0, N)
         farthest = 0
         
         for i in range(n_samples):
             sampled_indices[i] = farthest
             centroid = points[farthest]
-            
-            # 计算所有点到当前点的欧氏距离(3D)
             dist = np.sum((points - centroid) ** 2, axis=1)
             
-            # 更新每个点到已选点集的最小距离
             distances = np.minimum(distances, dist)
             
             # 选择距离最远的点
@@ -386,9 +376,7 @@ class RealWorldDataset(Dataset):
 
     def _extract_scene_names(self, demo_name):
         """
-        从demo名称中提取before和after的scene名称
-        例如: task_0103_user_0555_scene_0021_cfg_0001_BEFORE_task_0103_user_0555_scene_0028_cfg_0001_AFTER
-        返回: (before_scene, after_scene)
+        (before_scene, after_scene)
         """
         parts = demo_name.split('_BEFORE_')
         if len(parts) != 2:
@@ -401,19 +389,6 @@ class RealWorldDataset(Dataset):
             
 
     def world_to_camera_coords(self, world_coords, extrinsics):
-        """
-        将世界坐标系下的3D点转换为相机坐标系
-        
-        Args:
-            world_coords: (T, N, 3) or (N, 3) - 世界坐标系下的点
-            extrinsics: (4, 4) - 相机外参矩阵 (从相机到世界的变换)
-                注意：extrinsics 表示相机在世界坐标系中的位姿
-                world = extrinsics @ camera
-                因此：camera = inv(extrinsics) @ world
-        
-        Returns:
-            camera_coords: 相机坐标系下的点，shape与输入相同
-        """
         original_shape = world_coords.shape
         
         # Flatten to (M, 3) where M = T*N or N
@@ -423,20 +398,16 @@ class RealWorldDataset(Dataset):
         else:
             world_coords_flat = world_coords
         
-        # 转换为齐次坐标 (M, 4)
+        # (M, 4)
         ones = np.ones((world_coords_flat.shape[0], 1), dtype=world_coords_flat.dtype)
         world_coords_homo = np.concatenate([world_coords_flat, ones], axis=1)
         
-        # ===== 关键修改：需要使用外参的逆矩阵 =====
         # camera = inv(extrinsics) @ world
         inv_extrinsics = np.linalg.inv(extrinsics)
         camera_coords_homo = (inv_extrinsics @ world_coords_homo.T).T
-        # ===== 修改结束 =====
-        
-        # 转回3D坐标
         camera_coords = camera_coords_homo[:, :3]
         
-        # Reshape回原始形状
+        # Reshape
         if len(original_shape) == 3:
             camera_coords = camera_coords.reshape(original_shape)
         
@@ -533,8 +504,7 @@ class RealWorldDataset(Dataset):
 
     def _load_robot_tracks(self, demo_path, cam_id):
         """
-        Load robot tracks - 按文件顺序直接加载，不做硬编码对齐
-        让模型通过语义特征自动学习对应关系
+        Load robot tracks 
         """
         demo_name = os.path.basename(demo_path)
         _, after_scene = self._extract_scene_names(demo_name)
@@ -558,7 +528,6 @@ class RealWorldDataset(Dataset):
         robot_point_tracks_rel = []
         robot_semantic_features = []
         
-        # === 关键修改：直接按索引顺序加载，不管target_type ===
         for target_idx in range(1, self.num_targets + 1):
             # Load tracks
             robot_target_path = os.path.join(robot_tracks_dir, f"3d_tracks_target_after_{target_idx}.npy")
@@ -632,21 +601,21 @@ class RealWorldDataset(Dataset):
         projector = self.projectors[timestamp]
 
         # create color jitter
-        # if self.split == 'train' and self.aug_jitter:
-        #     jitter = T.ColorJitter(
-        #         brightness = self.aug_jitter_params[0],
-        #         contrast = self.aug_jitter_params[1],
-        #         saturation = self.aug_jitter_params[2],
-        #         hue = self.aug_jitter_params[3]
-        #     )
-        #     jitter = T.RandomApply([jitter], p = self.aug_jitter_prob)
+        if self.split == 'train' and self.aug_jitter:
+            jitter = T.ColorJitter(
+                brightness = self.aug_jitter_params[0],
+                contrast = self.aug_jitter_params[1],
+                saturation = self.aug_jitter_params[2],
+                hue = self.aug_jitter_params[3]
+            )
+            jitter = T.RandomApply([jitter], p = self.aug_jitter_prob)
 
         colors_list = []
         depths_list = []
         for frame_id in obs_frame_ids:
             colors = Image.open(os.path.join(color_dir, "{}.png".format(frame_id)))
-            # if self.split == 'train' and self.aug_jitter:
-            #     colors = jitter(colors)
+            if self.split == 'train' and self.aug_jitter:
+                colors = jitter(colors)
             colors_list.append(colors)
             depths_list.append(
                 np.array(Image.open(os.path.join(depth_dir, "{}.png".format(frame_id))), dtype = np.float32)
@@ -669,11 +638,9 @@ class RealWorldDataset(Dataset):
             cloud = np.concatenate([points, colors], axis = -1)
             clouds.append(cloud)
 
-            # 使用新的缓存方法加载tracks - 直接传入data_path
         human_tracks_abs, human_tracks_rel, human_semantics = self._load_human_tracks(data_path, cam_id)
         robot_tracks_abs, robot_tracks_rel, robot_semantics = self._load_robot_tracks(data_path, cam_id)
         
-        # ===== 关键修改: 保存robot的完整长度 =====
         robot_full_length = robot_tracks_abs.shape[0]
         
         # end_idx = max(1, track_idx + 1 - robot_start_idx - random.randint(0, 15))
@@ -718,13 +685,11 @@ class RealWorldDataset(Dataset):
             pcd.points = o3d.utility.Vector3dVector(points)
             pcd.colors = o3d.utility.Vector3dVector(colors * IMG_STD + IMG_MEAN)
             
-            # ===== 可视化action trajectory =====
             traj = []
             bbox3d_1 = o3d.geometry.AxisAlignedBoundingBox(WORKSPACE_MIN, WORKSPACE_MAX)
             bbox3d_1.color = [1, 0, 0]
             bbox3d_2 = o3d.geometry.AxisAlignedBoundingBox(TRANS_MIN, TRANS_MAX)
             bbox3d_2.color = [0, 1, 0]
-            # Track范围的bbox (绿色)
             bbox3d_3 = o3d.geometry.AxisAlignedBoundingBox(TRACK_MIN, TRACK_MAX)
             bbox3d_3.color = [0, 0, 1]
             
@@ -734,16 +699,12 @@ class RealWorldDataset(Dataset):
                 frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.03).transform(action)
                 traj.append(frame)
             
-            # ===== 新增：可视化human和robot tracks（绝对坐标） =====
             self.num_points = 10
             vis_geometries = [pcd.voxel_down_sample(self.voxel_size), bbox3d_1, bbox3d_2, bbox3d_3, *traj]
             
-            # 反normalize tracks到相机坐标系（米为单位，绝对坐标）
             def denormalize_tracks_absolute(normalized_tracks):
-                """将normalized tracks [-1,1] 转回绝对坐标（米）"""
                 return (normalized_tracks + 1) / 2 * (TRACK_MAX - TRACK_MIN) + TRACK_MIN
             
-            # Human tracks可视化
             human_tracks_denorm = denormalize_tracks_absolute(full_human_tracks_abs)  # (T, num_targets*num_points, 3)
             T_human = human_tracks_denorm.shape[0]
             human_tracks_reshaped = human_tracks_denorm.reshape(T_human, self.num_targets, self.num_points, 3)
@@ -754,22 +715,18 @@ class RealWorldDataset(Dataset):
             print(f"Range Y: [{human_tracks_reshaped[..., 1].min():.3f}, {human_tracks_reshaped[..., 1].max():.3f}]")
             print(f"Range Z: [{human_tracks_reshaped[..., 2].min():.3f}, {human_tracks_reshaped[..., 2].max():.3f}]")
             
-            # 为每个target创建不同颜色的轨迹
             import matplotlib.pyplot as plt
             cmap = plt.cm.rainbow
             
             for target_idx in range(self.num_targets):
-                color = cmap(target_idx / max(self.num_targets, 2))[:3]  # RGB颜色
+                color = cmap(target_idx / max(self.num_targets, 2))[:3] 
                 
-                # 为每个point创建轨迹线
                 for point_idx in range(self.num_points):
-                    # 获取该point的轨迹 (T, 3) - 绝对坐标
                     point_traj = human_tracks_reshaped[:, target_idx, point_idx, :]
                     
                     if T_human < 2:
                         continue
                     
-                    # 创建线段
                     lines = [[i, i+1] for i in range(T_human-1)]
                     line_set = o3d.geometry.LineSet()
                     line_set.points = o3d.utility.Vector3dVector(point_traj)
@@ -778,7 +735,6 @@ class RealWorldDataset(Dataset):
                     line_set.colors = o3d.utility.Vector3dVector(line_colors)
                     vis_geometries.append(line_set)
                     
-                    # 在第一帧和最后一帧添加球体标记
                     sphere_start = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
                     sphere_start.translate(point_traj[0])
                     sphere_start.paint_uniform_color(color)
@@ -786,10 +742,10 @@ class RealWorldDataset(Dataset):
                     
                     sphere_end = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)
                     sphere_end.translate(point_traj[-1])
-                    sphere_end.paint_uniform_color([c * 0.6 for c in color])  # 稍暗的颜色
+                    sphere_end.paint_uniform_color([c * 0.6 for c in color]) 
                     vis_geometries.append(sphere_end)
             
-            # Robot tracks可视化
+
             robot_tracks_denorm = denormalize_tracks_absolute(full_robot_tracks_abs)  # (T_robot, num_targets*num_points, 3)
             T_robot = robot_tracks_denorm.shape[0]
             robot_tracks_reshaped = robot_tracks_denorm.reshape(T_robot, self.num_targets, self.num_points, 3)
@@ -801,9 +757,8 @@ class RealWorldDataset(Dataset):
             print(f"Range Z: [{robot_tracks_reshaped[..., 2].min():.3f}, {robot_tracks_reshaped[..., 2].max():.3f}]")
             
             for target_idx in range(self.num_targets):
-                # 使用不同的颜色风格区分robot（使用更蓝/冷色调）
                 color = cmap((target_idx + 0.5) / max(self.num_targets, 2))[:3]
-                color = (color[0] * 0.5, color[1] * 0.5, color[2] * 1.0)  # 偏蓝色
+                color = (color[0] * 0.5, color[1] * 0.5, color[2] * 1.0) 
                 
                 for point_idx in range(self.num_points):
                     point_traj = robot_tracks_reshaped[:, target_idx, point_idx, :]
@@ -811,7 +766,6 @@ class RealWorldDataset(Dataset):
                     if T_robot < 2:
                         continue
                     
-                    # 创建线段
                     lines = [[i, i+1] for i in range(T_robot-1)]
                     line_set = o3d.geometry.LineSet()
                     line_set.points = o3d.utility.Vector3dVector(point_traj)
@@ -820,7 +774,6 @@ class RealWorldDataset(Dataset):
                     line_set.colors = o3d.utility.Vector3dVector(line_colors)
                     vis_geometries.append(line_set)
                     
-                    # 用方形标记robot轨迹的起点和终点
                     cube_start = o3d.geometry.TriangleMesh.create_box(width=0.015, height=0.015, depth=0.015)
                     cube_start.translate(point_traj[0] - [0.0075, 0.0075, 0.0075])
                     cube_start.paint_uniform_color(color)
@@ -901,18 +854,14 @@ def collate_fn(batch):
         ret_dict = {}
         for key in batch[0]:
             if key in TO_TENSOR_KEYS:
-                # === 修改开始: 处理 human_semantics 变长问题 ===
                 if key == 'human_semantics':
                     human_semantics_list = [d[key] for d in batch]
                     lengths = [hs.size(0) for hs in human_semantics_list]
                     if len(set(lengths)) == 1:
                         ret_dict[key] = torch.stack(human_semantics_list, 0)
-                        # 如果 tracks 没计算 lengths，这里也可以不计算，视情况而定
                     else:
-                        # 使用 create_variable_length_batch 进行 padding (默认为0)
                         padded_batch, _ = create_variable_length_batch(human_semantics_list)
                         ret_dict[key] = padded_batch
-                        # 不需要额外返回 semantic_lengths，因为它应该和 human_track_lengths 一致
                 
                 elif key == 'human_tracks_abs' or key == 'human_tracks_rel':
                     human_tracks_list = [d[key] for d in batch]
@@ -924,7 +873,6 @@ def collate_fn(batch):
                         padded_batch, track_lengths = create_variable_length_batch(human_tracks_list)
                         ret_dict[key] = padded_batch
                         ret_dict['human_track_lengths'] = track_lengths
-                # === 修改结束 ===
                         
                 elif key == 'robot_tracks_abs' or key == 'robot_tracks_rel':
                     robot_tracks_list = [d[key] for d in batch]
@@ -938,10 +886,8 @@ def collate_fn(batch):
                         ret_dict['robot_track_lengths'] = track_lengths
                 else:
                     ret_dict[key] = collate_fn([d[key] for d in batch])
-            # ===== 新增: 处理 robot_total_length =====
             elif key == 'robot_total_length':
                 ret_dict[key] = torch.tensor([d[key] for d in batch], dtype=torch.long)
-            # ===== 修改结束 =====
             else:
                 ret_dict[key] = [d[key] for d in batch]
                 

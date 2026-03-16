@@ -13,11 +13,6 @@ import numpy as np
 
 # policy/policy.py
 class SemanticCrossAttentionMatcher(nn.Module):
-    """
-    两阶段Cross-Attention:
-    1. 第一阶段：基于语义相似度硬匹配物体对应关系（直接选最相似的）
-    2. 第二阶段：在匹配的物体上做时序cross-attention
-    """
     def __init__(self, hidden_dim, semantic_dim=1152, num_heads=4, dropout=0.1, temperature=0.1):
         super().__init__()
         
@@ -254,7 +249,9 @@ class RISE(nn.Module):
         track_config=None,
         num_targets = 2,
         num_points = 10,
-        value_seq_len = 48  # value固定长度
+        track_encoder_ckpt=None,       # new
+        value_encoder_ckpt=None,       # new
+        value_seq_len = 48 
     ):
         super().__init__()
         num_obs = 1
@@ -273,7 +270,7 @@ class RISE(nn.Module):
 
         # 2. Track Encoder for Key (Pretrained)
         self.human_track_encoder = TrackEncoder(**track_config)
-        track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/rel_train_all_track_encoder_mae/encoder_only_epoch_100_seed_42.ckpt"
+        # track_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/rel_train_all_track_encoder_mae/encoder_only_epoch_100_seed_42.ckpt"
         if track_encoder_ckpt is not None:
             print(f"[HistRISE] Loading pretrained track encoder (Key) from {track_encoder_ckpt}...")
             ckpt = torch.load(track_encoder_ckpt, map_location='cpu')
@@ -296,7 +293,7 @@ class RISE(nn.Module):
 
         # 3. NEW: Track Encoder for Value (from different checkpoint)
         self.human_value_encoder = TrackEncoder(**track_config)
-        value_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/human_track_encoder_mae_window48/encoder_human_window48_epoch_50_seed_42.ckpt" 
+        # value_encoder_ckpt = "/data/jingjing/chkpts/su2/rise/task_0107/human_track_encoder_mae_window48/encoder_human_window48_epoch_50_seed_42.ckpt" 
         if value_encoder_ckpt is not None:
             print(f"[HistRISE] Loading pretrained value encoder from {value_encoder_ckpt}...")
             ckpt = torch.load(value_encoder_ckpt, map_location='cpu')
@@ -320,7 +317,7 @@ class RISE(nn.Module):
         track_output_dim = track_config['output_dim'] or track_config['query_dim']
 
         self.human_track_fusion = nn.Linear(track_output_dim, self.track_enc_dim)
-        self.human_value_fusion = nn.Linear(track_output_dim, self.track_enc_dim)  # value单独的fusion层
+        self.human_value_fusion = nn.Linear(track_output_dim, self.track_enc_dim) 
         
         # 4. Semantic Cross Attention Matcher
         semantic_dim = 1152

@@ -41,7 +41,11 @@ default_args = edict({
     "save_epochs": 50,
     "num_workers": 24,
     "seed": 233,
-    "vis_data": False
+    "vis_data": False,
+    "num_targets": 4,
+    "track_encoder_ckpt": None,    # new
+    "value_encoder_ckpt": None,    # new
+    "value_seq_len": 16,           # new
 })
 
 
@@ -77,7 +81,7 @@ def train(args_override):
         aug_jitter = args.aug_jitter, 
         with_cloud = False,
         vis = args.vis_data,
-        num_targets = 3
+        num_targets = args.num_targets 
     )
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, 
@@ -124,7 +128,10 @@ def train(args_override):
         num_attn_layers=4,
         dropout=args.dropout,
         track_config = track_config,
-        num_targets=3,  # or from args
+        num_targets = args.num_targets,
+        track_encoder_ckpt = args.track_encoder_ckpt,   # new
+        value_encoder_ckpt = args.value_encoder_ckpt,   # new
+        value_seq_len = args.value_seq_len
         num_points=10
     ).to(device)
     
@@ -188,10 +195,8 @@ def train(args_override):
             human_semantics = data.get('human_semantics', None)
             robot_semantics = data.get('robot_semantics', None)
             
-            # ===== 新增: 提取 robot_total_length =====
             robot_total_length = data.get('robot_total_length', None)
-            # ===== 修改结束 =====
-            # Move to device
+
             cloud_feats = cloud_feats.to(device)
             cloud_coords = cloud_coords.to(device)
             action_data = action_data.to(device)
@@ -212,11 +217,8 @@ def train(args_override):
                 human_semantics = human_semantics.to(device)
             if robot_semantics is not None:
                 robot_semantics = robot_semantics.to(device)
-            
-            # ===== 新增: 移动 robot_total_length 到 device =====
             if robot_total_length is not None:
                 robot_total_length = robot_total_length.to(device)
-            # ===== 修改结束 =====
             
             cloud_data = ME.SparseTensor(cloud_feats, cloud_coords)
             # forward
@@ -287,5 +289,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', action = 'store', type = int, help = 'number of workers', required = False, default = 24)
     parser.add_argument('--seed', action = 'store', type = int, help = 'seed', required = False, default = 233)
     parser.add_argument('--vis_data', action = 'store_true', help = 'whether to visualize the input data and ground truth actions.')
-
+    parser.add_argument('--num_targets', action = 'store', type = int, help = 'number of targets to use', required = False, default = 3)
+    parser.add_argument('--track_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--value_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--value_seq_len', type=int, default=16)
     train(vars(parser.parse_args()))

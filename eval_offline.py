@@ -42,7 +42,6 @@ default_args = edict({
 
 
 def unnormalize_action(action):
-    """反归一化动作"""
     action = action.clone()
     
     trans_min = torch.tensor(TRANS_MIN, dtype=action.dtype, device=action.device)
@@ -100,7 +99,7 @@ def evaluate(args_override):
         os.makedirs(args.save_dir)
     
     # Load dataset
-    print("加载数据集...")
+    print("Load dataset...")
     dataset = RealWorldDataset(
         path = args.data_path,
         split = 'train',
@@ -112,9 +111,8 @@ def evaluate(args_override):
         aug_jitter = args.aug_jitter, 
         with_cloud = True,
         vis = args.vis_data,
-        num_targets = 2
+        num_targets = args.num_targets
     )
-    # 过滤数据集
     if args.scene_filter:
         filtered_indices = []
         for i, data_path in enumerate(dataset.data_paths):
@@ -158,7 +156,7 @@ def evaluate(args_override):
     }
 
     # Load model
-    print("加载模型...")
+    print("Load model...")
     policy = RISE(
         num_action=args.num_action,
         input_dim=6,  # sinput feature dim
@@ -171,19 +169,21 @@ def evaluate(args_override):
         num_attn_layers=4,
         dropout=args.dropout,
         track_config = track_config,
-        num_targets=2,  # or from args
+        num_targets = args.num_targets,
+        track_encoder_ckpt = args.track_encoder_ckpt,   # new
+        value_encoder_ckpt = args.value_encoder_ckpt,   # new
+        value_seq_len = args.value_seq_len
         num_points=10
     ).to(device)
-    assert args.ckpt is not None, "请提供checkpoint路径"
     
     policy.load_state_dict(torch.load(args.ckpt, map_location=device), strict=False)
-    print(f"已加载checkpoint: {args.ckpt}")
+    print(f"checkpoint: {args.ckpt}")
     
     # Evaluation
     policy.eval()
     
 
-    print("开始评估...")
+    print("Evaluation...")
     with torch.inference_mode():
         for sample_idx, data in enumerate(tqdm(dataloader)):
             if sample_idx <= args.num_samples:
@@ -270,5 +270,9 @@ if __name__ == '__main__':
     parser.add_argument('--aug', action = 'store_true', help = 'whether to add 3D data augmentation')
     parser.add_argument('--aug_jitter', action = 'store_true', help = 'whether to add color jitter augmentation')
     parser.add_argument('--vis_data', action = 'store_true', help = 'whether to visualize the input data and ground truth actions.')
-
+    parser.add_argument('--num_targets', action = 'store', type = int, help = 'number of targets to use', required = False, default = 3)
+    parser.add_argument('--track_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--value_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--value_seq_len', type=int, default=16)
+    
     evaluate(vars(parser.parse_args()))
