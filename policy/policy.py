@@ -11,11 +11,6 @@ from policy.track.model import TrackEncoder
 from utils.constants import TRACK_MIN, TRACK_MAX
 
 class SemanticCrossAttentionMatcher(nn.Module):
-    """
-    两阶段Cross-Attention:
-    1. 第一阶段：基于语义相似度匹配物体对应关系
-    2. 第二阶段：在匹配的物体上做时序cross-attention
-    """
     def __init__(self, hidden_dim, semantic_dim=1152, num_heads=4, dropout=0.1, temperature=0.1):
         super().__init__()
         
@@ -280,7 +275,7 @@ class HistRISE(nn.Module):
         self.human_track_fusion = nn.Linear(track_output_dim, hidden_dim)
         
         # 2. Semantic Matcher
-        # self.semantic_proj = nn.Linear(1152, hidden_dim) # SigLIP 映射
+        # self.semantic_proj = nn.Linear(1152, hidden_dim)
         semantic_dim = 1152
         self.track_enc_dim = 512
         self.cross_attention_matcher = SemanticCrossAttentionMatcher(
@@ -304,24 +299,15 @@ class HistRISE(nn.Module):
         self.voxel_size = 0.005
 
     def denormalize_tracks(self, normalized_tracks):
-        """
-        反normalize tracks: [-1, 1] -> 原始绝对坐标（相机坐标系）
-        
-        Args:
-            normalized_tracks: (..., 3) normalized coordinates
-            
-        Returns:
-            tracks: (..., 3) absolute camera coordinates in meters
-        """
         return (normalized_tracks + 1) / 2 * (self.track_max - self.track_min) + self.track_min
 
     def compute_robot_track_centers(self, robot_tracks, robot_effective_len):
         """
         Args:
-            robot_tracks: (batch, seq_len, num_targets*num_points, 3) - normalized
+            robot_tracks: (batch, seq_len, num_targets*num_points, 3)
             
         Returns:
-            centers: (batch, num_targets, 3) - 原始坐标系下的中心
+            centers: (batch, num_targets, 3)
         """
         from sklearn.cluster import DBSCAN
         
@@ -334,30 +320,25 @@ class HistRISE(nn.Module):
         batch_indices = torch.arange(batch_size, device=robot_tracks.device)
         last_frame_tracks = robot_tracks_denorm[batch_indices, target_indices]
 
-        # 预分配numpy数组而不是list
         centers = np.zeros((batch_size, self.num_targets, 3), dtype=np.float32)
         
         for b in range(batch_size):
             for t in range(self.num_targets):
                 points = last_frame_tracks[b, t].cpu().numpy()  # (num_points, 3)
                 
-                # DBSCAN聚类
                 clustering = DBSCAN(eps=0.05, min_samples=2).fit(points)
                 labels = clustering.labels_
                 
-                # 找到最大的cluster
                 unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
                 if len(unique_labels) > 0:
                     largest_cluster_label = unique_labels[np.argmax(counts)]
                     cluster_points = points[labels == largest_cluster_label]
                     center = cluster_points.mean(axis=0)
                 else:
-                    # 如果没有有效cluster，使用所有点的中心
                     center = points.mean(axis=0)
                 
                 centers[b, t] = center
         
-        # 直接从numpy array转换为tensor
         centers = torch.from_numpy(centers).to(device=robot_tracks.device, dtype=robot_tracks.dtype)
         
         return centers
@@ -419,23 +400,19 @@ class HistRISE(nn.Module):
         tokens = self.human_track_encoder(robot_tracks, lengths=robot_track_lengths)
         batch_size, num_pts_enc, num_q, dim = tokens.shape
         tokens = self.human_track_fusion(tokens.view(batch_size, -1, dim))
-        # 还原 target 维度并取平均: (B, num_targets, num_points, D) -> (B, num_targets, D)
+        #（B, num_targets, num_points, D) -> (B, num_targets, D)
         return tokens.reshape(batch_size, self.num_targets, self.num_points, -1).mean(dim=2)
 
 
     def compute_dense_human_embeddings(self, human_tracks, human_track_lengths):
         """
-        专门用于可视化：计算 human_tracks 中每一个时间步 t 的 embedding。
-        即计算 t -> End 的轨迹特征，对于 t=0...T
-        
         Args:
             human_tracks: (batch, T, num_targets, num_points, 3)
             human_track_lengths: (batch,)
             
         Returns:
-            all_embeddings: (T, num_targets, hidden_dim) - 仅返回 batch 0 的结果
+            all_embeddings: (T, num_targets, hidden_dim)
         """
-        # 为了可视化，我们只处理 batch 中的第一个样本
         b = 0 
         T = human_tracks.shape[1]
         num_targets = self.num_targets
@@ -445,27 +422,16 @@ class HistRISE(nn.Module):
         device = human_tracks.device
         all_embeddings = []
 
-        # 为了避免显存爆炸，我们逐个时间步或者小批次处理
-        # 这里采用逐个时间步循环处理 (Batch=1 * Num_Targets)
         for t in range(actual_len):
-            # 1. 截取从 t 到 结束 的轨迹
             # shape: (future_len, num_targets, num_points, 3)
             track_segment = human_tracks[b, t:actual_len]
             future_len = track_segment.shape[0]
-            
-            # 2. 构造 Encoder 输入
-            # 需要 reshape 成 (num_targets, future_len, num_points, 3)
-            # 因为 TrackEncoder 期望 (Batch, Seq, Points, Dim)
             encoder_input = track_segment.permute(1, 0, 2, 3) 
-            
-            # 构造 lengths: (num_targets,)，所有 target 的长度都是 future_len
             lengths = torch.full((num_targets,), future_len, dtype=torch.long, device=device)
             
-            # 3. 通过 Encoder
             # output: (num_targets, num_points, num_queries, dim)
             tokens = self.human_track_encoder(encoder_input, lengths=lengths)
             
-            # 4. Fusion & Pooling (保持和 encode_human_embedding_at_ratio 一致的逻辑)
             # (num_targets, num_points * num_queries, dim)
             _, num_points_enc, num_queries, dim = tokens.shape
             tokens = tokens.view(num_targets, num_points_enc * num_queries, dim)
@@ -476,7 +442,7 @@ class HistRISE(nn.Module):
             
             all_embeddings.append(tokens)
             
-        # 堆叠结果: (T, num_targets, hidden_dim)
+        # (T, num_targets, hidden_dim)
         return torch.stack(all_embeddings, dim=0)
 
     def forward(self, cloud, actions=None, 
@@ -502,8 +468,6 @@ class HistRISE(nn.Module):
         range_tensor = torch.arange(T, device=src.device).unsqueeze(0).expand(batch_size, -1)
         h_mask = range_tensor >= human_track_lengths.unsqueeze(1)
         
-        # 执行匹配：用 Robot Query 去查 Human Key，取对应的 Value
-        # Step 4: 语义增强的Cross Attention（无需for循环！）
         matched_embedding = self.cross_attention_matcher(
             robot_query=robot_query,
             robot_sem=robot_semantics,  # (batch, num_targets, semantic_dim)
@@ -542,39 +506,32 @@ class HistRISE(nn.Module):
             human_k_vis = human_k[0]  # (T_human, num_targets, hidden_dim)
             T_human = human_k_vis.shape[0]
             
-            # 创建保存目录
             save_dir = "vis_robot_human_similarity"
             os.makedirs(save_dir, exist_ok=True)
             
-            # 可视化 Robot Query vs Human Key
             fig, axes = plt.subplots(1, self.num_targets, figsize=(8*self.num_targets, 4))
             if self.num_targets == 1:
                 axes = [axes]
             
             for target_idx in range(self.num_targets):
-                # 提取当前target的embeddings
                 robot_q = robot_query_vis[target_idx:target_idx+1, :]  # (1, hidden_dim)
                 human_k_target = human_k_vis[:, target_idx, :]  # (T_human, hidden_dim)
                 
-                # 归一化
                 robot_q_norm = F.normalize(robot_q, p=2, dim=1)  # (1, hidden_dim)
                 human_k_norm = F.normalize(human_k_target, p=2, dim=1)  # (T_human, hidden_dim)
                 
-                # 计算相似度: (1, T_human)
+                # (1, T_human)
                 similarity = torch.matmul(robot_q_norm, human_k_norm.T)
                 similarity = (similarity + 1) / 2  # [-1,1] -> [0,1]
                 similarity = similarity.squeeze(0).detach().cpu().numpy()  # (T_human,)
                 
-                # 保存数据
                 npy_path = os.path.join(save_dir, f'query_similarity_target_{target_idx}_scene_{scene_id:04d}.npy')
                 np.save(npy_path, similarity)
                 
-                # 绘制折线图
                 ax = axes[target_idx]
                 ax.plot(range(T_human), similarity, 'b-', linewidth=2, label='Similarity')
                 ax.fill_between(range(T_human), similarity, alpha=0.3)
                 
-                # 标注最大值
                 max_idx = similarity.argmax()
                 max_val = similarity[max_idx]
                 ax.plot(max_idx, max_val, 'r*', markersize=15, 
@@ -609,31 +566,25 @@ class HistRISE(nn.Module):
             np.save(npy_save_path, dense_embeddings.detach().cpu().numpy())
             print(f"[Vis] Saved embeddings to {npy_save_path}")
 
-            # 1. 调整维度顺序：(Num_Targets, T, Dim)
-            # dense_embeddings 是 (T, Targets, Dim)，permute 成 (Targets, T, Dim)
+
             all_keys = dense_embeddings.permute(1, 0, 2).contiguous()
             
-            # 3. 展平: (Num_Targets * T, Dim)
+            # (Num_Targets * T, Dim)
             flat_keys = all_keys.view(-1, hidden_dim)
-            
-            # 4. 归一化以便计算余弦相似度
             flat_keys_norm = F.normalize(flat_keys, p=2, dim=1)
             
-            # 5. 计算相似度矩阵 ((Num_Targets*T) x (Num_Targets*T))
+            # ((Num_Targets*T) x (Num_Targets*T))
             sim_matrix = torch.mm(flat_keys_norm, flat_keys_norm.t()).detach().cpu().numpy()
             
-            # 6. 绘图
             plt.figure(figsize=(14, 12))
             im = plt.imshow(sim_matrix, cmap='viridis', vmin=0.0, vmax=1.0)
             plt.colorbar(im, label='Cosine Similarity')
             
-            # 7. 画白色网格线区分不同的 Target
             for i in range(1, num_targets):
                 boundary = i * vis_T - 0.5 
                 plt.axhline(y=boundary, color='white', linestyle='--', linewidth=1, alpha=0.7)
                 plt.axvline(x=boundary, color='white', linestyle='--', linewidth=1, alpha=0.7)
             
-            # 8. 设置刻度
             tick_locs = []
             tick_labels = []
             tick_interval = 10 
@@ -658,7 +609,6 @@ class HistRISE(nn.Module):
             print(f"[Vis] Saved matrix to {save_dir}/matrix_step_{step_idx:04d}.png")
         # ====================================================================
 
-        # 3. 位置编码与融合 (保持原代码逻辑)
         if robot_track_lengths is not None:
             robot_effective_len = robot_track_lengths.float()  # (batch,)
         else:
@@ -667,11 +617,9 @@ class HistRISE(nn.Module):
         robot_centers = self.compute_robot_track_centers(robot_tracks_abs, robot_effective_len)
         robot_coords_voxel = (robot_centers / self.voxel_size).long()  # (batch, num_targets, 3)
         
-        # 为每个batch的每个target生成位置编码
         robot_pos_list = []
         for b in range(batch_size):
             batch_coords = robot_coords_voxel[b]  # (num_targets, 3)
-            # 构造coords_list格式: 每个元素是 (N, 4), 其中第一列是batch_id
             coords_with_batch = torch.cat([
                 torch.zeros(self.num_targets, 1, dtype=torch.long, device=batch_coords.device),
                 batch_coords

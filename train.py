@@ -195,10 +195,7 @@ def train(args_override):
             robot_track_lengths = data.get('robot_track_lengths', None)
             human_semantics = data.get('human_semantics', None)
             robot_semantics = data.get('robot_semantics', None)
-            
-            # ===== 新增: 提取 robot_total_length =====
             robot_total_length = data.get('robot_total_length', None)
-            # ===== 修改结束 =====
 
             # Move to device
             cloud_feats = cloud_feats.to(device)
@@ -221,11 +218,8 @@ def train(args_override):
                 human_semantics = human_semantics.to(device)
             if robot_semantics is not None:
                 robot_semantics = robot_semantics.to(device)
-            
-            # ===== 新增: 移动 robot_total_length 到 device =====
             if robot_total_length is not None:
                 robot_total_length = robot_total_length.to(device)
-            # ===== 修改结束 =====
             
             cloud_data = ME.SparseTensor(cloud_feats, cloud_coords)
             
